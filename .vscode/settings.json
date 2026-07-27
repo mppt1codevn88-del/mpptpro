@@ -1,0 +1,20 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.extensionActivationMode": "always",
+  "idf.openOcdConfigs": [
+    "board/esp32c5-builtin.cfg"
+  ],
+  "idf.portWin": "COM8",
+  "idf.currentSetup": "D:\\esp\\v6.0.2\\esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32c5",
+    "OPENOCD_USB_ADAPTER_LOCATION": "2-1"
+  },
+  "clangd.path": "D:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\MPPT_Batt\\esp32c5_Batt_v0\\build"
+  ],
+  "idf.flashType": "UART"
+}

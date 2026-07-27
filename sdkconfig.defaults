@@ -1,0 +1,16 @@
+# ===== Partition table tùy chỉnh cho OTA (2 slot) =====
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_ota.csv"
+
+# ===== Kích thước flash: đặt 4MB (đổi thành 8MB nếu board bạn có 8MB) =====
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# ===== Bật cơ chế rollback tự động =====
+# Nếu firmware mới không tự gọi esp_ota_mark_app_valid_cancel_rollback()
+# trong lần khởi động đầu tiên, bootloader sẽ tự quay về firmware cũ.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ===== Cho phép HTTPS OTA đọc kích thước ảnh động =====
+CONFIG_ESP_HTTPS_OTA_DECRYPT_CB=n
