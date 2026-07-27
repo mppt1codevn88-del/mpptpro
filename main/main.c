@@ -835,7 +835,14 @@ static bool do_ota_update(const char *url) {
         .timeout_ms = 20000,
         .keep_alive_enable = true,
 
-        .buffer_size = 2048,     // Tăng bộ đệm nhận Rx lên 2KB (mặc định cấu hình IDF chỉ có 512b hoặc 1024b)
+        // TĂNG buffer_size (2048 -> 8192): link tải file .bin từ GitHub Releases
+        // luôn CHUYỂN HƯỚNG (redirect) sang máy chủ objects.githubusercontent.com
+        // kèm 1 dòng "Location" header rất dài (có chữ ký bảo mật AWS). Nếu
+        // buffer_size quá nhỏ, dòng Location bị CẮT CỤT giữa chừng, ESP32 sẽ
+        // đi theo 1 link hỏng và tải nhầm trang lỗi thay vì file .bin thật —
+        // đây chính là nguyên nhân gây lỗi "Mismatch chip id... found 65535"
+        // (đọc trúng vùng flash trống vì không có dữ liệu thật nào được ghi).
+        .buffer_size = 8192,
         .buffer_size_tx = 1024,  // Tăng bộ đệm gửi Tx lên 1KB
     };
     esp_https_ota_config_t ota_cfg = {
@@ -1605,7 +1612,13 @@ static void ota_ensure_default_url(void) {
 
 // Cấu trúc Firebase mong đợi tại /mppt/ota:
 //   { "latestVersion": 2, "url": "<link .bin tren Firebase Storage>", "command": true/false }
-// Khi command==true VÀ latestVersion > FIRMWARE_VERSION -> tiến hành OTA.
+// Khi command==true VÀ latestVersion >= FIRMWARE_VERSION -> tiến hành OTA.
+// Dùng ">=" (thay vì ">") để hỗ trợ CẢ 2 trường hợp:
+//   1) Nâng cấp lên bản MỚI HƠN (latestVersion > FIRMWARE_VERSION) — dùng khi
+//      Admin phát hành bản cập nhật thật sự.
+//   2) Cài lại ĐÚNG bản đang chạy (latestVersion == FIRMWARE_VERSION) — dùng
+//      khi app/web gọi "Code Backup - Cài lại qua WiFi" để khắc phục lỗi
+//      phần mềm (không phải nâng cấp), không đổi số phiên bản.
 static void pull_ota(void) {
     static char buf[512];
     if (!fb_get(dev_path("/mppt/ota"), buf, sizeof(buf))) return;
@@ -1621,7 +1634,7 @@ static void pull_ota(void) {
     bool want_update = cmd && cJSON_IsBool(cmd) && cJSON_IsTrue(cmd);
     int latest = (ver && cJSON_IsNumber(ver)) ? ver->valueint : 0;
 
-    if (want_update && latest > FIRMWARE_VERSION && url && cJSON_IsString(url)) {
+    if (want_update && latest >= FIRMWARE_VERSION && url && cJSON_IsString(url)) {
         // Xóa cờ command ngay để tránh lặp lại OTA sau khi reboot
         fb_put(dev_path("/mppt/ota/command"), "false");
         char url_copy[400];
