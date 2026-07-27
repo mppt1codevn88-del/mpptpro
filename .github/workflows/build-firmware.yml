@@ -11,6 +11,14 @@
 
 name: Build & Release Firmware
 
+# QUAN TRỌNG: mặc định GITHUB_TOKEN chỉ có quyền ĐỌC, khiến bước "Tạo GitHub
+# Release" bên dưới bị từ chối (403) một cách ÂM THẦM — tag vẫn được tạo (vì
+# đó là do máy bạn `git push` tag lên, không liên quan tới Action), nhưng
+# Action không tạo được Release + không đính kèm được file .bin. Khai báo rõ
+# quyền ghi ở đây để sửa dứt điểm.
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main]      # build thử mỗi khi đẩy code lên main (không release)
