@@ -65,3 +65,28 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================================
+      # QUAN TRỌNG: Link "releases/download/..." đôi khi TẢI THẤT BẠI trên
+      # ESP32 (phải qua 1 bước chuyển hướng phức tạp sang máy chủ khác kèm
+      # link rất dài, dễ gây lỗi "Mismatch chip id" khi OTA). Bước này tự
+      # commit thẳng file .bin vào code repo (mỗi bản 1 tên file riêng,
+      # KHÔNG đè bản cũ) để có link "raw.githubusercontent.com" — tải trực
+      # tiếp, không chuyển hướng, ổn định hơn nhiều cho vi điều khiển.
+      # Vì không đè file cũ, link của v1 không bao giờ đổi -> dùng cố định
+      # cho "Code Backup" (Phương án 1) là an toàn tuyệt đối.
+      # ============================================================
+      - name: Đưa file firmware vào repo (để có link raw.githubusercontent.com ổn định)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          mkdir -p firmware
+          cp ${{ env.ASSET_NAME }} firmware/${{ env.ASSET_NAME }}
+          git add firmware/${{ env.ASSET_NAME }}
+          git commit -m "Them firmware binary ${{ github.ref_name }} (tu dong tu CI)"
+          git push origin main
+          echo "### 🔗 Link OTA ổn định (dùng link này, KHÔNG dùng link Releases ở trên):" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://raw.githubusercontent.com/${{ github.repository }}/main/firmware/${{ env.ASSET_NAME }}\`" >> $GITHUB_STEP_SUMMARY

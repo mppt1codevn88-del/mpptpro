@@ -101,10 +101,9 @@ static void device_id_init(void) {
 // Link firmware mặc định (đóng cứng trong code) — dùng làm giá trị khởi tạo cho những thiết bị
 // CHƯA từng được Admin cấu hình link OTA riêng trên Firebase. Admin vẫn có thể đổi link này
 // bất cứ lúc nào từ trang quản trị (ghi đè /mppt/ota/url trên Firebase), không cần build lại code.
-// LƯU Ý ĐỊNH DẠNG: GitHub Releases yêu cầu link tải trực tiếp phải có dạng:
-//   https://github.com/{owner}/{repo}/releases/download/{tag}/{tên_file.bin}
-// (chứ không phải .../releases/firmware_v2.bin như link bạn gửi — thiếu "/download/{tag}/").
-#define OTA_DEFAULT_URL "https://github.com/mppt1codevn88-del/firmware_bomppt/releases/download/v2/firmware_v2.bin"
+// DÙNG "raw.githubusercontent.com" (KHÔNG dùng .../releases/download/...): link Releases phải qua
+// bước chuyển hướng phức tạp, dễ gây lỗi "Mismatch chip id" khi OTA — link raw tải trực tiếp, ổn định.
+#define OTA_DEFAULT_URL "https://raw.githubusercontent.com/mppt1codevn88-del/mpptpro/main/firmware/firmware_v1.bin"
 
 // ============================================================
 //   1. SƠ ĐỒ CHÂN — giống bản Arduino cho ESP32-C5 Mini
@@ -835,13 +834,12 @@ static bool do_ota_update(const char *url) {
         .timeout_ms = 20000,
         .keep_alive_enable = true,
 
-        // TĂNG buffer_size (2048 -> 8192): link tải file .bin từ GitHub Releases
-        // luôn CHUYỂN HƯỚNG (redirect) sang máy chủ objects.githubusercontent.com
-        // kèm 1 dòng "Location" header rất dài (có chữ ký bảo mật AWS). Nếu
-        // buffer_size quá nhỏ, dòng Location bị CẮT CỤT giữa chừng, ESP32 sẽ
-        // đi theo 1 link hỏng và tải nhầm trang lỗi thay vì file .bin thật —
-        // đây chính là nguyên nhân gây lỗi "Mismatch chip id... found 65535"
-        // (đọc trúng vùng flash trống vì không có dữ liệu thật nào được ghi).
+        // TĂNG buffer_size (2048 -> 8192): link .bin từ GitHub Releases luôn
+        // CHUYỂN HƯỚNG sang objects.githubusercontent.com kèm dòng "Location"
+        // rất dài (chữ ký AWS). buffer nhỏ làm dòng đó bị cắt cụt -> tải nhầm
+        // trang lỗi -> lỗi "Mismatch chip id... found 65535" (đọc trúng vùng
+        // flash trống). Dùng link raw.githubusercontent.com (không redirect)
+        // thì an toàn hơn nữa, nhưng vẫn để buffer lớn cho chắc.
         .buffer_size = 8192,
         .buffer_size_tx = 1024,  // Tăng bộ đệm gửi Tx lên 1KB
     };
@@ -1611,16 +1609,23 @@ static void ota_ensure_default_url(void) {
 }
 
 // Cấu trúc Firebase mong đợi tại /mppt/ota:
-//   { "latestVersion": 2, "url": "<link .bin tren Firebase Storage>", "command": true/false }
+//   { "latestVersion": 2, "url": "<link .bin>", "command": true/false }
 // Khi command==true VÀ latestVersion >= FIRMWARE_VERSION -> tiến hành OTA.
 // Dùng ">=" (thay vì ">") để hỗ trợ CẢ 2 trường hợp:
-//   1) Nâng cấp lên bản MỚI HƠN (latestVersion > FIRMWARE_VERSION) — dùng khi
-//      Admin phát hành bản cập nhật thật sự.
+//   1) Nâng cấp lên bản MỚI HƠN (latestVersion > FIRMWARE_VERSION).
 //   2) Cài lại ĐÚNG bản đang chạy (latestVersion == FIRMWARE_VERSION) — dùng
-//      khi app/web gọi "Code Backup - Cài lại qua WiFi" để khắc phục lỗi
-//      phần mềm (không phải nâng cấp), không đổi số phiên bản.
+//      cho "Code Backup - Cài lại qua WiFi" để khắc phục lỗi phần mềm, không
+//      đổi số phiên bản.
 static void pull_ota(void) {
-    static char buf[512];
+    // buf phải ĐỦ LỚN để chứa TOÀN BỘ node /mppt/ota dạng JSON, gồm:
+    //   command, currentVersion, latestVersion, url (link GitHub ~80-100 ký
+    //   tự), và cả object status {state, progress, fwVer}.
+    // Trước đây buf[512] quá nhỏ: sau khi thêm tính năng cấu hình link qua
+    // Admin (URL dài hơn + đủ field), tổng JSON vượt 512 byte -> bị CẮT CỤT
+    // -> cJSON_Parse trả về NULL -> hàm return sớm, OTA KHÔNG BAO GIỜ chạy.
+    // Đây chính là lý do "thêm link qua Admin thì cả web lẫn app đều không
+    // cập nhật được". Tăng lên 2048 byte cho dư dả.
+    static char buf[2048];
     if (!fb_get(dev_path("/mppt/ota"), buf, sizeof(buf))) return;
     if (strlen(buf) < 3 || strstr(buf, "null")) return;
 
