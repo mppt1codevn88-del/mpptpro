@@ -86,7 +86,13 @@ jobs:
           mkdir -p firmware
           cp ${{ env.ASSET_NAME }} firmware/${{ env.ASSET_NAME }}
           git add firmware/${{ env.ASSET_NAME }}
-          git commit -m "Them firmware binary ${{ github.ref_name }} (tu dong tu CI)"
-          git push origin main
+          # QUAN TRỌNG: nếu chạy lại (re-run) cùng 1 tag mà nội dung file KHÔNG
+          # đổi so với lần trước, "git commit" sẽ báo "nothing to commit" và
+          # thoát với mã lỗi khác 0 -> làm cả bước này (và cả job) bị đánh dấu
+          # THẤT BẠI dù build/release phía trên đều đã thành công. Dùng
+          # "git diff --staged --quiet ||" để CHỈ commit khi thực sự có gì
+          # thay đổi, không có gì thay đổi thì bỏ qua êm, không báo lỗi.
+          git diff --staged --quiet && echo "Khong co gi moi de commit, bo qua." || \
+            (git commit -m "Them firmware binary ${{ github.ref_name }} (tu dong tu CI)" && git push origin main)
           echo "### 🔗 Link OTA ổn định (dùng link này, KHÔNG dùng link Releases ở trên):" >> $GITHUB_STEP_SUMMARY
           echo "\`https://raw.githubusercontent.com/${{ github.repository }}/main/firmware/${{ env.ASSET_NAME }}\`" >> $GITHUB_STEP_SUMMARY
