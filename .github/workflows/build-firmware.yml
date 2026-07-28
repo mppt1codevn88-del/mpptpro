@@ -31,14 +31,6 @@ jobs:
     steps:
       - name: Lấy code từ repo
         uses: actions/checkout@v4
-        with:
-          # BẮT BUỘC fetch-depth: 0 (tải đủ lịch sử + mọi nhánh).
-          # Mặc định checkout chỉ tải ĐÚNG 1 commit của ref đang chạy (shallow).
-          # Khi workflow chạy do đẩy TAG, bản sao đó KHÔNG chứa nhánh main ->
-          # lệnh "git checkout main" ở bước cuối sẽ THẤT BẠI -> cả job bị đỏ,
-          # dù build/release phía trên đã thành công. Đây chính là lý do các
-          # lượt chạy trên nhánh main thì xanh, còn trên tag v1 thì luôn đỏ.
-          fetch-depth: 0
 
       - name: Build bằng ESP-IDF (v5.5 trở lên mới hỗ trợ chính thức ESP32-C5)
         uses: espressif/esp-idf-ci-action@v1
@@ -75,40 +67,49 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # ============================================================
-      # QUAN TRỌNG: Link "releases/download/..." đôi khi TẢI THẤT BẠI trên
-      # ESP32 (phải qua 1 bước chuyển hướng phức tạp sang máy chủ khác kèm
-      # link rất dài, dễ gây lỗi "Mismatch chip id" khi OTA). Bước này tự
-      # commit thẳng file .bin vào code repo (mỗi bản 1 tên file riêng,
-      # KHÔNG đè bản cũ) để có link "raw.githubusercontent.com" — tải trực
-      # tiếp, không chuyển hướng, ổn định hơn nhiều cho vi điều khiển.
-      # Vì không đè file cũ, link của v1 không bao giờ đổi -> dùng cố định
-      # cho "Code Backup" (Phương án 1) là an toàn tuyệt đối.
+      # repo mpptpro (chứa mã nguồn) là PRIVATE — raw.githubusercontent.com
+      # KHÔNG phục vụ được nội dung repo Private cho request không đăng nhập
+      # (mà ESP32 thì gọi HTTPS thuần, không có token) -> phải đẩy file .bin
+      # sang 1 repo PUBLIC RIÊNG (firmware_bomppt) để ESP32 tải được công
+      # khai, trong khi mã nguồn thật vẫn được giữ kín trong mpptpro.
+      #
+      # Dùng SSH DEPLOY KEY (không dùng Personal Access Token): deploy key
+      # chỉ có quyền trên ĐÚNG 1 repo firmware_bomppt (đã bật "Allow write
+      # access" khi thêm ở phần Settings → Deploy keys của repo đó), an toàn
+      # hơn PAT (vốn thường có quyền trên nhiều/mọi repo), và không có hạn
+      # dùng — dùng lâu dài không cần tạo lại token định kỳ.
+      # Cần secret FIRMWARE_DEPLOY_SSH_KEY (khoá RIÊNG TƯ của cặp khoá deploy
+      # key, xem hướng dẫn thiết lập ở HUONG_DAN.md / phần chat).
       # ============================================================
-      - name: Đưa file firmware vào repo (để có link raw.githubusercontent.com ổn định)
+      - name: Nạp SSH deploy key để đẩy sang firmware_bomppt
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.FIRMWARE_DEPLOY_SSH_KEY }}
+
+      - name: Đẩy file firmware sang repo Public firmware_bomppt (qua SSH)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Cất file .bin ra NGOÀI thư mục repo TRƯỚC khi đổi nhánh: file này
-          # vừa được build ra, chưa thuộc nhánh nào, nên thao tác checkout có
-          # thể làm mất nó khỏi thư mục làm việc.
           cp ${{ env.ASSET_NAME }} /tmp/${{ env.ASSET_NAME }}
-          git fetch origin main
-          # Dùng "-B main origin/main": TẠO MỚI (hoặc reset) nhánh local "main"
-          # bám đúng theo origin/main. An toàn hơn "git checkout main" vốn giả
-          # định nhánh local main đã tồn tại sẵn — điều KHÔNG đúng khi workflow
-          # được kích hoạt bởi tag.
-          git checkout -B main origin/main
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Ghi sẵn "vân tay" máy chủ github.com vào known_hosts, để lệnh git
+          # qua SSH chạy được KHÔNG CẦN người ngồi xác nhận (CI chạy tự động,
+          # không có ai gõ "yes" như lúc bạn tự ssh -T git@github.com trên máy).
+          mkdir -p ~/.ssh
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone git@github.com:mppt1codevn88-del/firmware_bomppt.git /tmp/firmware_repo
+          cd /tmp/firmware_repo
           mkdir -p firmware
           cp /tmp/${{ env.ASSET_NAME }} firmware/${{ env.ASSET_NAME }}
-          git add firmware/${{ env.ASSET_NAME }}
-          # QUAN TRỌNG: nếu chạy lại (re-run) cùng 1 tag mà nội dung file KHÔNG
-          # đổi so với lần trước, "git commit" sẽ báo "nothing to commit" và
-          # thoát với mã lỗi khác 0 -> làm cả bước này (và cả job) bị đánh dấu
-          # THẤT BẠI dù build/release phía trên đều đã thành công. Dùng
-          # "git diff --staged --quiet ||" để CHỈ commit khi thực sự có gì
-          # thay đổi, không có gì thay đổi thì bỏ qua êm, không báo lỗi.
+          # -f để phòng trường hợp repo firmware_bomppt cũng có .gitignore chặn *.bin
+          git add -f firmware/${{ env.ASSET_NAME }}
           git diff --staged --quiet && echo "Khong co gi moi de commit, bo qua." || \
-            (git commit -m "Them firmware binary ${{ github.ref_name }} (tu dong tu CI)" && git push origin main)
-          echo "### 🔗 Link OTA ổn định (dùng link này, KHÔNG dùng link Releases ở trên):" >> $GITHUB_STEP_SUMMARY
-          echo "\`https://raw.githubusercontent.com/${{ github.repository }}/main/firmware/${{ env.ASSET_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+            (git commit -m "Them firmware binary ${{ github.ref_name }} (tu dong tu CI cua mpptpro)" && git push)
+
+          echo "### 🔗 Link OTA công khai (repo Public firmware_bomppt):" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://raw.githubusercontent.com/mppt1codevn88-del/firmware_bomppt/main/firmware/${{ env.ASSET_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ Nếu nhánh mặc định của firmware_bomppt KHÔNG phải \`main\` (vd \`master\`), sửa lại URL trên cho đúng." >> $GITHUB_STEP_SUMMARY
