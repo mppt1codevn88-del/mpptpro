@@ -102,10 +102,12 @@ static void device_id_init(void) {
 // CHƯA từng được Admin cấu hình link OTA riêng trên Firebase. Admin vẫn có thể đổi link này
 // bất cứ lúc nào từ trang quản trị (ghi đè /mppt/ota/url trên Firebase), không cần build lại code.
 // DÙNG "raw.githubusercontent.com" (KHÔNG dùng .../releases/download/...): link Releases phải qua
-// bước chuyển hướng phức tạp, dễ gây lỗi "Mismatch chip id" khi OTA — link raw tải trực tiếp, ổn định.
-// LƯU Ý: phải trỏ tới repo PUBLIC (firmware_bomppt), KHÔNG trỏ tới repo Private (mpptpro) — vì
-// raw.githubusercontent.com không phục vụ được nội dung repo Private cho request không đăng nhập.
-#define OTA_DEFAULT_URL "https://raw.githubusercontent.com/mppt1codevn88-del/firmware_bomppt/main/firmware/firmware_v1.bin"
+// bước chuyển hướng phức tạp, dễ gây lỗi khi OTA — link raw tải trực tiếp, ổn định.
+// QUAN TRỌNG: PHẢI trỏ tới file "_app.bin" (chỉ chứa app, do idf.py build tạo TRƯỚC khi gộp),
+// TUYỆT ĐỐI KHÔNG dùng file "_full.bin" (đã gộp bootloader+partition+app, chỉ dành cho nạp
+// USB ở offset 0x0) — dùng nhầm file gộp làm OTA sẽ luôn báo lỗi "Mismatch chip id... found
+// 65535" vì phần đầu file gộp là vùng đệm trống (0xFF), không phải app image thật.
+#define OTA_DEFAULT_URL "https://raw.githubusercontent.com/mppt1codevn88-del/firmware_bomppt/main/firmware/firmware_v1_app.bin"
 
 // ============================================================
 //   1. SƠ ĐỒ CHÂN — giống bản Arduino cho ESP32-C5 Mini

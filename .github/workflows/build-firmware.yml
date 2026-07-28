@@ -6,16 +6,29 @@
 #   - Muốn phát hành bản chính thức: tạo & đẩy 1 "tag" dạng vX (ví dụ v3):
 #       git tag v3
 #       git push origin v3
-#     -> workflow tự build + gộp file + tạo GitHub Release, đính kèm file
-#     .bin gộp sẵn, có link tải công khai để dùng cho "Phương án 2" trong app.
+#     -> workflow tự build, tạo RA 2 FILE RIÊNG BIỆT (xem giải thích bên dưới),
+#     tạo GitHub Release, và đẩy cả 2 file sang repo Public firmware_bomppt.
+#
+# ============================================================
+# TẠI SAO CẦN 2 FILE RIÊNG (đây là nguyên nhân gốc của lỗi OTA
+# "Mismatch chip id... found 65535" từng gặp):
+#   - firmware_vX_app.bin  : CHỈ chứa app (idf.py build tạo ra, TRƯỚC khi
+#                            gộp) -> dùng cho OTA QUA WIFI (esp_https_ota chỉ
+#                            ghi đè đúng phần app, không đụng bootloader).
+#   - firmware_vX_full.bin : Gộp bootloader + bảng phân vùng + app (esptool
+#                            merge_bin) -> CHỈ dùng để nạp TOÀN BỘ qua USB ở
+#                            offset 0x0 (Phương án 2 khi mất sạch firmware).
+# Trước đây dùng NHẦM file "full" (gộp) làm link OTA — vì bootloader không
+# nằm ở đầu file, phần đầu file "full" là vùng ĐỆM TRỐNG (byte 0xFF) cho tới
+# đúng vị trí bootloader thật -> esp_https_ota đọc trúng vùng đệm trống đó,
+# báo "Mismatch chip id... found 65535 (=0xFFFF)". Đây là lỗi khái niệm, không
+# phải lỗi Git/lỗi mạng như các giả thuyết trước.
+# ============================================================
 
 name: Build & Release Firmware
 
 # QUAN TRỌNG: mặc định GITHUB_TOKEN chỉ có quyền ĐỌC, khiến bước "Tạo GitHub
-# Release" bên dưới bị từ chối (403) một cách ÂM THẦM — tag vẫn được tạo (vì
-# đó là do máy bạn `git push` tag lên, không liên quan tới Action), nhưng
-# Action không tạo được Release + không đính kèm được file .bin. Khai báo rõ
-# quyền ghi ở đây để sửa dứt điểm.
+# Release" bên dưới bị từ chối (403) một cách ÂM THẦM. Khai báo rõ quyền ghi.
 permissions:
   contents: write
 
@@ -37,49 +50,46 @@ jobs:
         with:
           esp_idf_version: v5.5
           target: esp32c5
-          # Build xong thì cd vào build/, dùng flash_args (đã tính sẵn theo
-          # sdkconfig) để gộp bootloader + partition table + app thành 1 file.
           command: >
             idf.py build &&
+            APP_BIN=$(python3 -c "import json; print(json.load(open('build/project_description.json'))['app_bin'])") &&
+            cp "build/$APP_BIN" firmware_app.bin &&
             cd build &&
-            esptool.py --chip esp32c5 merge_bin -o ../firmware_merged.bin @flash_args
+            esptool.py --chip esp32c5 merge_bin -o ../firmware_full.bin @flash_args
 
       - name: Đặt tên file kèm số phiên bản
         run: |
           SAFE_NAME=$(echo "${{ github.ref_name }}" | tr '/' '-')
-          mv firmware_merged.bin "firmware_${SAFE_NAME}.bin"
-          echo "ASSET_NAME=firmware_${SAFE_NAME}.bin" >> $GITHUB_ENV
+          mv firmware_app.bin "firmware_${SAFE_NAME}_app.bin"
+          mv firmware_full.bin "firmware_${SAFE_NAME}_full.bin"
+          echo "ASSET_APP=firmware_${SAFE_NAME}_app.bin" >> $GITHUB_ENV
+          echo "ASSET_FULL=firmware_${SAFE_NAME}_full.bin" >> $GITHUB_ENV
 
       - name: Lưu làm Artifact (luôn chạy — xem/tải tạm thời trong tab Actions)
         uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: ${{ env.ASSET_NAME }}
+          path: |
+            ${{ env.ASSET_APP }}
+            ${{ env.ASSET_FULL }}
           retention-days: 30
 
       - name: Tạo GitHub Release (chỉ khi đẩy tag vX)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET_NAME }}
+          files: |
+            ${{ env.ASSET_APP }}
+            ${{ env.ASSET_FULL }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # ============================================================
       # repo mpptpro (chứa mã nguồn) là PRIVATE — raw.githubusercontent.com
-      # KHÔNG phục vụ được nội dung repo Private cho request không đăng nhập
-      # (mà ESP32 thì gọi HTTPS thuần, không có token) -> phải đẩy file .bin
-      # sang 1 repo PUBLIC RIÊNG (firmware_bomppt) để ESP32 tải được công
-      # khai, trong khi mã nguồn thật vẫn được giữ kín trong mpptpro.
-      #
-      # Dùng SSH DEPLOY KEY (không dùng Personal Access Token): deploy key
-      # chỉ có quyền trên ĐÚNG 1 repo firmware_bomppt (đã bật "Allow write
-      # access" khi thêm ở phần Settings → Deploy keys của repo đó), an toàn
-      # hơn PAT (vốn thường có quyền trên nhiều/mọi repo), và không có hạn
-      # dùng — dùng lâu dài không cần tạo lại token định kỳ.
-      # Cần secret FIRMWARE_DEPLOY_SSH_KEY (khoá RIÊNG TƯ của cặp khoá deploy
-      # key, xem hướng dẫn thiết lập ở HUONG_DAN.md / phần chat).
+      # không phục vụ được nội dung repo Private cho request không đăng nhập
+      # -> đẩy 2 file .bin sang repo PUBLIC RIÊNG (firmware_bomppt), dùng SSH
+      # Deploy Key (chỉ có quyền trên đúng repo đó, không có hạn dùng).
       # ============================================================
       - name: Nạp SSH deploy key để đẩy sang firmware_bomppt
         if: startsWith(github.ref, 'refs/tags/')
@@ -87,16 +97,14 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.FIRMWARE_DEPLOY_SSH_KEY }}
 
-      - name: Đẩy file firmware sang repo Public firmware_bomppt (qua SSH)
+      - name: Đẩy 2 file firmware sang repo Public firmware_bomppt (qua SSH)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          cp ${{ env.ASSET_NAME }} /tmp/${{ env.ASSET_NAME }}
+          cp ${{ env.ASSET_APP }} /tmp/${{ env.ASSET_APP }}
+          cp ${{ env.ASSET_FULL }} /tmp/${{ env.ASSET_FULL }}
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Ghi sẵn "vân tay" máy chủ github.com vào known_hosts, để lệnh git
-          # qua SSH chạy được KHÔNG CẦN người ngồi xác nhận (CI chạy tự động,
-          # không có ai gõ "yes" như lúc bạn tự ssh -T git@github.com trên máy).
           mkdir -p ~/.ssh
           ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
 
@@ -104,27 +112,24 @@ jobs:
           cd /tmp/firmware_repo
           mkdir -p firmware
 
-          # ============================================================
-          # CỰC KỲ QUAN TRỌNG: khai báo *.bin là NHỊ PHÂN trước khi commit.
-          # Nếu không có dòng này, Git có thể tự "sửa" file .bin (đổi byte
-          # xuống dòng LF <-> CRLF) vì tưởng đây là file văn bản — chỉ cần
-          # lệch 1 byte ở đầu file là esp_https_ota đọc sai toàn bộ header,
-          # gây đúng lỗi "Mismatch chip id... found 65535" dù link tải vẫn
-          # "có vẻ" hoạt động bình thường khi mở bằng trình duyệt (kích
-          # thước file gần như không đổi, mắt thường không thấy được).
-          # ============================================================
+          # Khai báo *.bin là NHỊ PHÂN trước khi commit, tránh Git tự "sửa"
+          # byte xuống dòng (dù không phải nguyên nhân chính lần này, vẫn nên
+          # giữ để phòng ngừa lâu dài).
           if ! grep -q '\*.bin binary' .gitattributes 2>/dev/null; then
             echo "*.bin binary" >> .gitattributes
             git add .gitattributes
           fi
 
-          cp /tmp/${{ env.ASSET_NAME }} firmware/${{ env.ASSET_NAME }}
-          # -f để phòng trường hợp repo firmware_bomppt cũng có .gitignore chặn *.bin
-          git add -f firmware/${{ env.ASSET_NAME }}
+          cp /tmp/${{ env.ASSET_APP }} firmware/${{ env.ASSET_APP }}
+          cp /tmp/${{ env.ASSET_FULL }} firmware/${{ env.ASSET_FULL }}
+          git add -f firmware/${{ env.ASSET_APP }} firmware/${{ env.ASSET_FULL }}
           git diff --staged --quiet && echo "Khong co gi moi de commit, bo qua." || \
-            (git commit -m "Them firmware binary ${{ github.ref_name }} (tu dong tu CI cua mpptpro)" && git push)
+            (git commit -m "Them firmware ${{ github.ref_name }} (app + full, tu dong tu CI cua mpptpro)" && git push)
 
-          echo "### 🔗 Link OTA công khai (repo Public firmware_bomppt):" >> $GITHUB_STEP_SUMMARY
-          echo "\`https://raw.githubusercontent.com/mppt1codevn88-del/firmware_bomppt/main/firmware/${{ env.ASSET_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Link OTA qua WiFi (dùng link này cho Code Backup / OTA_DEFAULT_URL / Admin):" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://raw.githubusercontent.com/mppt1codevn88-del/firmware_bomppt/main/firmware/${{ env.ASSET_APP }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Link nạp FULL qua USB (dùng cho nút Tải file firmware.bin / Flash Download Tools):" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://raw.githubusercontent.com/mppt1codevn88-del/firmware_bomppt/main/firmware/${{ env.ASSET_FULL }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "⚠️ Nếu nhánh mặc định của firmware_bomppt KHÔNG phải \`main\` (vd \`master\`), sửa lại URL trên cho đúng." >> $GITHUB_STEP_SUMMARY
