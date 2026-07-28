@@ -96,7 +96,7 @@ static void device_id_init(void) {
 #define FIREBASE_HOST "https://battery-solar-system-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 // ---- OTA: phiên bản firmware hiện tại (tăng số này mỗi lần phát hành bản mới) ----
-#define FIRMWARE_VERSION 1
+#define FIRMWARE_VERSION 2
 
 // Link firmware mặc định (đóng cứng trong code) — dùng làm giá trị khởi tạo cho những thiết bị
 // CHƯA từng được Admin cấu hình link OTA riêng trên Firebase. Admin vẫn có thể đổi link này
