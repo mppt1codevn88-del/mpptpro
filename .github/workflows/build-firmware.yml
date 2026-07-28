@@ -103,6 +103,21 @@ jobs:
           git clone git@github.com:mppt1codevn88-del/firmware_bomppt.git /tmp/firmware_repo
           cd /tmp/firmware_repo
           mkdir -p firmware
+
+          # ============================================================
+          # CỰC KỲ QUAN TRỌNG: khai báo *.bin là NHỊ PHÂN trước khi commit.
+          # Nếu không có dòng này, Git có thể tự "sửa" file .bin (đổi byte
+          # xuống dòng LF <-> CRLF) vì tưởng đây là file văn bản — chỉ cần
+          # lệch 1 byte ở đầu file là esp_https_ota đọc sai toàn bộ header,
+          # gây đúng lỗi "Mismatch chip id... found 65535" dù link tải vẫn
+          # "có vẻ" hoạt động bình thường khi mở bằng trình duyệt (kích
+          # thước file gần như không đổi, mắt thường không thấy được).
+          # ============================================================
+          if ! grep -q '\*.bin binary' .gitattributes 2>/dev/null; then
+            echo "*.bin binary" >> .gitattributes
+            git add .gitattributes
+          fi
+
           cp /tmp/${{ env.ASSET_NAME }} firmware/${{ env.ASSET_NAME }}
           # -f để phòng trường hợp repo firmware_bomppt cũng có .gitignore chặn *.bin
           git add -f firmware/${{ env.ASSET_NAME }}
