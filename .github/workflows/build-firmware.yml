@@ -31,6 +31,14 @@ jobs:
     steps:
       - name: Lấy code từ repo
         uses: actions/checkout@v4
+        with:
+          # BẮT BUỘC fetch-depth: 0 (tải đủ lịch sử + mọi nhánh).
+          # Mặc định checkout chỉ tải ĐÚNG 1 commit của ref đang chạy (shallow).
+          # Khi workflow chạy do đẩy TAG, bản sao đó KHÔNG chứa nhánh main ->
+          # lệnh "git checkout main" ở bước cuối sẽ THẤT BẠI -> cả job bị đỏ,
+          # dù build/release phía trên đã thành công. Đây chính là lý do các
+          # lượt chạy trên nhánh main thì xanh, còn trên tag v1 thì luôn đỏ.
+          fetch-depth: 0
 
       - name: Build bằng ESP-IDF (v5.5 trở lên mới hỗ trợ chính thức ESP32-C5)
         uses: espressif/esp-idf-ci-action@v1
@@ -81,10 +89,18 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Cất file .bin ra NGOÀI thư mục repo TRƯỚC khi đổi nhánh: file này
+          # vừa được build ra, chưa thuộc nhánh nào, nên thao tác checkout có
+          # thể làm mất nó khỏi thư mục làm việc.
+          cp ${{ env.ASSET_NAME }} /tmp/${{ env.ASSET_NAME }}
           git fetch origin main
-          git checkout main
+          # Dùng "-B main origin/main": TẠO MỚI (hoặc reset) nhánh local "main"
+          # bám đúng theo origin/main. An toàn hơn "git checkout main" vốn giả
+          # định nhánh local main đã tồn tại sẵn — điều KHÔNG đúng khi workflow
+          # được kích hoạt bởi tag.
+          git checkout -B main origin/main
           mkdir -p firmware
-          cp ${{ env.ASSET_NAME }} firmware/${{ env.ASSET_NAME }}
+          cp /tmp/${{ env.ASSET_NAME }} firmware/${{ env.ASSET_NAME }}
           git add firmware/${{ env.ASSET_NAME }}
           # QUAN TRỌNG: nếu chạy lại (re-run) cùng 1 tag mà nội dung file KHÔNG
           # đổi so với lần trước, "git commit" sẽ báo "nothing to commit" và
