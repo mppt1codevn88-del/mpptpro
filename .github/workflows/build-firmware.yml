@@ -50,11 +50,15 @@ jobs:
         with:
           esp_idf_version: v5.5
           target: esp32c5
-          command: >
-            idf.py build &&
-            APP_BIN=$(python3 -c "import json; print(json.load(open('build/project_description.json'))['app_bin'])") &&
-            cp "build/$APP_BIN" firmware_app.bin &&
-            cd build &&
+          # LƯU Ý CÚ PHÁP: dùng "|" (literal block) chứ KHÔNG dùng ">" (folded).
+          # ">" gộp mọi dòng thành 1 dòng và làm hỏng dấu nháy trong lệnh, từng
+          # gây lỗi: NameError: name 'build' is not defined.
+          # esp32c5_Batt_v0.bin = tên app image (theo tên project trong
+          # CMakeLists.txt gốc). Nếu sau này đổi tên project, sửa lại dòng cp.
+          command: |
+            idf.py build
+            cp build/esp32c5_Batt_v0.bin firmware_app.bin
+            cd build
             esptool.py --chip esp32c5 merge_bin -o ../firmware_full.bin @flash_args
 
       - name: Đặt tên file kèm số phiên bản
