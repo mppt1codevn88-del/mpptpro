@@ -457,6 +457,8 @@ static esp_ota_img_states_t g_ota_state_after_mark = ESP_OTA_IMG_UNDEFINED;
 //                          "markValidWorked: true" rất dễ tưởng nhầm là ảnh mới
 //                          đã tự xác nhận thành công.
 static bool g_ota_was_pending_at_boot = false;
+// Version ĐÍCH của lần cài đang diễn ra (bản sắp thay thế). 0 = không cài gì.
+static int g_ota_target_ver = 0;
 static volatile bool g_start_ap_mode   = false;   // true khi admin/boot yêu cầu reset WiFi
 
 // ---- Cực LED: đổi thành 0 nếu LED của bạn sáng khi GPIO ở mức CAO (active-high) ----
@@ -832,10 +834,19 @@ static void start_wifi_manager(void) {
 static void fb_put(const char *path, const char *json);
 
 // Báo trạng thái OTA ngược lên Firebase để web hiển thị
+// LƯU Ý VỀ Ý NGHĨA CỦA fwVer (chỗ này rất hay bị hiểu nhầm):
+//   fwVer = phiên bản của FIRMWARE ĐANG CHẠY VÀ ĐANG GHI DÒNG BÁO CÁO NÀY.
+// Toàn bộ quá trình tải + ghi flash đều do BẢN CŨ thực hiện (bản mới lúc đó
+// mới chỉ nằm im trong flash, chưa chạy). Nên trong suốt lúc cập nhật, kể cả
+// khi state="success", fwVer VẪN PHẢI LÀ 1 — đó là hành vi ĐÚNG, không phải lỗi.
+// Nó chỉ đổi thành 2 ở lần boot SAU, khi bản mới thực sự chạy và tự báo cáo.
+// Thêm targetVer để nhìn phát biết ngay "đang cài lên bản mấy".
 static void ota_report(const char *state, int progress) {
-    char j[128];
-    snprintf(j, sizeof(j), "{\"state\":\"%s\",\"progress\":%d,\"fwVer\":%d}",
-             state, progress, FIRMWARE_VERSION);
+    char j[192];
+    snprintf(j, sizeof(j),
+             "{\"state\":\"%s\",\"progress\":%d,\"fwVer\":%d,"
+             "\"runningVer\":%d,\"targetVer\":%d}",
+             state, progress, FIRMWARE_VERSION, FIRMWARE_VERSION, g_ota_target_ver);
     fb_put(dev_path("/mppt/ota/status"), j);
 }
 
@@ -1822,6 +1833,7 @@ static void pull_ota(void) {
         // (phát hiện rollback) — xem phần kết luận trong app_main.
         char jpend[16];
         snprintf(jpend, sizeof(jpend), "%d", latest);
+        g_ota_target_ver = latest;   // để status/targetVer hiện đúng bản đang cài
         fb_put(dev_path("/mppt/ota/pendingVersion"), jpend);
         fb_put(dev_path("/mppt/ota/lastResult"), "\"installing\"");
         char url_copy[400];
