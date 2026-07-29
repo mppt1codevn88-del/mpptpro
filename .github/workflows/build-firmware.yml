@@ -79,6 +79,17 @@ jobs:
           # LƯU Ý CÚ PHÁP: dùng "|" (literal block) chứ KHÔNG dùng ">" (folded).
           # ">" gộp mọi dòng thành 1 dòng và làm hỏng dấu nháy trong lệnh, từng
           # gây lỗi: NameError: name 'build' is not defined.
+          #
+          # ★ LƯU Ý THÊM (lỗi mới gặp): action này CŨNG xử lý sai khi trong
+          # "command" có ký tự "|" ở BẤT KỲ ĐÂU, kể cả nằm gọn trong dấu nháy
+          # đơn của 1 lệnh grep -E (dùng "|" làm regex alternation). Nó tách
+          # nhầm chuỗi tại từng dấu "|" đó rồi cố chạy từng mảnh như 1 lệnh
+          # riêng -> "CONFIG_ESP_MAIN_TASK_STACK_SIZE: command not found".
+          # KHÔNG dùng bất kỳ dấu "|" nào (pipe lẫn regex alternation) trong
+          # khối "command" này, kể cả trong dấu nháy. Bước in cấu hình để đối
+          # chiếu đã dời ra 1 step RIÊNG chạy shell bình thường trên runner
+          # (xem step "In cấu hình đã build" ngay sau step này).
+          #
           # esp32c5_Batt_v0.bin = tên app image (theo tên project trong
           # CMakeLists.txt gốc). Nếu sau này đổi tên project, sửa lại dòng cp.
           command: |
@@ -87,10 +98,23 @@ jobs:
             cd build
             esptool.py --chip esp32c5 merge_bin -o ../firmware_full.bin @flash_args
             cd ..
-            # In ra vài mục cấu hình QUYẾT ĐỊNH của bản build thật (đọc từ
-            # sdkconfig do CI sinh ra), để đối chiếu nhanh khi có sự cố.
-            echo "----- CAU HINH THAT SU DUOC BUILD -----"
-            grep -E 'CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT|CONFIG_ESP_MAIN_TASK_STACK_SIZE|CONFIG_PARTITION_TABLE|CONFIG_ESPTOOLPY_FLASHSIZE=|CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE' sdkconfig || true
+
+      # Đọc lại sdkconfig do CI SINH RA (không phải sdkconfig.defaults ta commit)
+      # để đối chiếu xem các tuỳ chọn quyết định có thật sự vào bản build hay
+      # không. Chạy trên runner bình thường (không qua action ở trên) nên
+      # không dính lỗi phân tách "|" như đã ghi chú ở step build.
+      - name: In cấu hình đã build (đối chiếu nhanh khi có sự cố)
+        run: |
+          echo "----- CAU HINH THAT SU DUOC BUILD -----"
+          if [ -f sdkconfig ]; then
+            grep -E "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT" sdkconfig || true
+            grep -E "CONFIG_ESP_MAIN_TASK_STACK_SIZE" sdkconfig || true
+            grep -E "CONFIG_PARTITION_TABLE" sdkconfig || true
+            grep -E "CONFIG_ESPTOOLPY_FLASHSIZE=" sdkconfig || true
+            grep -E "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE" sdkconfig || true
+          else
+            echo "::warning::Khong tim thay file sdkconfig sau khi build."
+          fi
 
       - name: Đặt tên file kèm số phiên bản
         run: |
