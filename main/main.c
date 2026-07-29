@@ -36,6 +36,7 @@
 #include "esp_http_client.h"
 #include "esp_https_ota.h"    // <-- OTA qua HTTPS
 #include "esp_ota_ops.h"      // <-- rollback / xác nhận firmware
+#include "esp_app_desc.h"     // <-- đọc mô tả app đang chạy (version/ngày build) để chẩn đoán OTA
 #include "esp_heap_caps.h"
 
 #include "nvs_flash.h"
@@ -901,8 +902,65 @@ static bool do_ota_update(const char *url) {
     return true;  // không bao giờ tới đây
 }
 
+// ============================================================
+//  ★★★ SỬA LỖI GỐC: "OTA báo thành công nhưng máy vẫn chạy bản cũ" ★★★
+//
+//  ESP-IDF bật CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE thì ảnh firmware vừa OTA
+//  xong sẽ khởi động ở trạng thái ESP_OTA_IMG_PENDING_VERIFY. Nếu thiết bị
+//  KHỞI ĐỘNG LẠI LẦN NỮA trước khi gọi esp_ota_mark_app_valid_cancel_rollback(),
+//  bootloader coi bản mới là hỏng và TỰ QUAY LUI (rollback) về bản cũ VĨNH VIỄN.
+//
+//  Bản cũ chỉ gọi hàm xác nhận này SAU KHI: có WiFi + có NTP + chạy tiếp 15 giây.
+//  Mà ngay trong app_main, nếu WiFi không lên trong 15s HOẶC NTP hỏng 3 lần thì
+//  request_external_reset() sẽ đá GPIO2 -> mạch ngoài cắt nguồn -> reboot.
+//  Reboot đó xảy ra TRƯỚC lúc xác nhận => rollback về v1. Vòng lặp: cài v2 xong,
+//  báo "success", khởi động lại, rớt về v1, Firebase ghi currentVersion=1,
+//  status.fwVer=1 — ĐÚNG như hiện tượng đang thấy trên bo 3.
+//
+//  Cách sửa: xác nhận NGAY ở đầu app_main (thao tác cục bộ trên flash, không cần
+//  mạng). Firmware đã tự bảo vệ bằng cơ chế reset ngoài + watchdog riêng rồi,
+//  không cần dựa vào rollback của bootloader.
+// ============================================================
+static void ota_mark_valid_now(void) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) return;
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(running, &st) != ESP_OK) return;
+    if (st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t e = esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGW(TAG, "Firmware moi (partition %s) -> XAC NHAN HOP LE ngay luc boot: %s",
+                 running->label, esp_err_to_name(e));
+    } else {
+        ESP_LOGI(TAG, "Partition dang chay: %s (img_state=%d)", running->label, (int)st);
+    }
+}
+
+// Đẩy "chứng minh thư" của firmware đang chạy lên Firebase để CHẨN ĐOÁN:
+//   part     : ota_0 / ota_1 / factory  -> biết OTA đã đổi phân vùng chưa
+//   built    : ngày+giờ biên dịch        -> biết file .bin có đúng bản mới không
+//   imgState : 1=PENDING_VERIFY, 2=VALID, 4=ABORTED(đã bị rollback)
+// Chỉ cần nhìn node này là biết ngay "máy có từng chạy v2 chưa" hay "file .bin
+// trên GitHub thực chất vẫn là bản cũ".
+static void ota_report_build_info(void) {
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    const esp_app_desc_t *d = esp_app_get_description();
+    esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+    if (run) esp_ota_get_state_partition(run, &st);
+    static char j[420];
+    snprintf(j, sizeof(j),
+             "{\"fwVer\":%d,\"part\":\"%s\",\"appVer\":\"%s\",\"built\":\"%s %s\","
+             "\"imgState\":%d,\"idf\":\"%s\"}",
+             FIRMWARE_VERSION,
+             run ? run->label : "?",
+             d ? d->version : "?",
+             d ? d->date : "?", d ? d->time : "?",
+             (int)st,
+             d ? d->idf_ver : "?");
+    fb_put(dev_path("/mppt/ota/build"), j);
+}
+
 // Xác nhận firmware mới chạy tốt (chống rollback). Gọi sau khi hệ thống ổn định.
-// Sửa hàm này trong main.c
+// (Giữ lại làm lớp dự phòng — thực tế đã được xác nhận từ đầu app_main.)
 static void ota_mark_valid_if_pending(void) {
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t st;
@@ -1646,6 +1704,12 @@ static void pull_ota(void) {
     if (want_update && latest >= FIRMWARE_VERSION && url && cJSON_IsString(url)) {
         // Xóa cờ command ngay để tránh lặp lại OTA sau khi reboot
         fb_put(dev_path("/mppt/ota/command"), "false");
+        // Ghi lại "bản đang định cài" để sau khi reboot còn biết mà đối chiếu
+        // (phát hiện rollback) — xem phần kết luận trong app_main.
+        char jpend[16];
+        snprintf(jpend, sizeof(jpend), "%d", latest);
+        fb_put(dev_path("/mppt/ota/pendingVersion"), jpend);
+        fb_put(dev_path("/mppt/ota/lastResult"), "\"installing\"");
         char url_copy[400];
         strncpy(url_copy, url->valuestring, sizeof(url_copy)-1);
         url_copy[sizeof(url_copy)-1] = 0;
@@ -1653,6 +1717,14 @@ static void pull_ota(void) {
         // Thực hiện OTA (hàm này sẽ reboot nếu thành công)
         do_ota_update(url_copy);
         return;
+    }
+    // Có lệnh nhưng version yêu cầu THẤP HƠN bản đang chạy (vd Admin lỡ đặt v1
+    // trong khi máy đã ở v2): không cài, nhưng phải hạ cờ, nếu không cờ command
+    // treo mãi ở true và mỗi 30s lại vào đây một lần.
+    if (want_update && latest < FIRMWARE_VERSION) {
+        ESP_LOGW(TAG, "Bo qua OTA: latestVersion=%d < FIRMWARE_VERSION=%d", latest, FIRMWARE_VERSION);
+        fb_put(dev_path("/mppt/ota/command"), "false");
+        fb_put(dev_path("/mppt/ota/lastResult"), "\"skipped_older\"");
     }
     cJSON_Delete(root);
 }
@@ -1663,6 +1735,11 @@ static void pull_ota(void) {
 void app_main(void) {
     ram_reserve_init();         // KHOÁ 10% RAM ngay dòng đầu tiên — giữ nguyên suốt vòng đời chương trình
     nvs_flash_init();
+
+    // ★ PHẢI GỌI SỚM NHẤT CÓ THỂ — trước mọi thứ có thể gây reboot (WiFi lỗi,
+    //   NTP lỗi -> request_external_reset). Nếu chậm, bootloader sẽ rollback
+    //   bản firmware vừa OTA về bản cũ và mọi lần cập nhật đều "thành công giả".
+    ota_mark_valid_now();
     nvs_load_all();
     adc_setup();
     pwm_setup();
@@ -1714,6 +1791,32 @@ void app_main(void) {
         snprintf(jv, sizeof(jv), "%d", FIRMWARE_VERSION);
         fb_put(dev_path("/mppt/ota/currentVersion"), jv);
         ota_report("idle", 0);
+        ota_report_build_info();
+
+        // ---- KẾT LUẬN LẦN CÀI TRƯỚC ----
+        // pull_ota() ghi pendingVersion = bản sắp cài NGAY TRƯỚC khi OTA. Sau khi
+        // khởi động lại, so sánh với version thật đang chạy:
+        //   FIRMWARE_VERSION >= pending -> cài thành công thật ("ok")
+        //   FIRMWARE_VERSION <  pending -> đã bị QUAY LUI ("rollback")
+        // App/web đọc /mppt/ota/lastResult để báo đúng sự thật cho người dùng,
+        // thay vì báo "thành công" rồi version vẫn đứng yên.
+        static char pvbuf[32];
+        int pending = 0;
+        if (fb_get(dev_path("/mppt/ota/pendingVersion"), pvbuf, sizeof(pvbuf))) {
+            pending = atoi(pvbuf);
+        }
+        if (pending > 0) {
+            if (FIRMWARE_VERSION >= pending) {
+                fb_put(dev_path("/mppt/ota/lastResult"), "\"ok\"");
+                ESP_LOGW(TAG, "OTA: da chay dung ban v%d", FIRMWARE_VERSION);
+            } else {
+                fb_put(dev_path("/mppt/ota/lastResult"), "\"rollback\"");
+                ESP_LOGE(TAG, "OTA: yeu cau v%d nhung dang chay v%d -> DA BI ROLLBACK",
+                         pending, FIRMWARE_VERSION);
+            }
+            fb_put(dev_path("/mppt/ota/pendingVersion"), "0");
+        }
+
         ota_ensure_default_url();
     }
 
