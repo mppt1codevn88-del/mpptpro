@@ -98,7 +98,7 @@ static void device_id_init(void) {
 #define FIREBASE_HOST "https://battery-solar-system-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 // ---- OTA: phiên bản firmware hiện tại (tăng số này mỗi lần phát hành bản mới) ----
-#define FIRMWARE_VERSION 2
+#define FIRMWARE_VERSION 1
 
 // Link firmware mặc định (đóng cứng trong code) — dùng làm giá trị khởi tạo cho những thiết bị
 // CHƯA từng được Admin cấu hình link OTA riêng trên Firebase. Admin vẫn có thể đổi link này
@@ -832,6 +832,11 @@ static void start_wifi_manager(void) {
 // ============================================================
 // Khai báo trước hàm fb_put (định nghĩa ở phần Firebase bên dưới)
 static void fb_put(const char *path, const char *json);
+// Khai báo trước hàm bàn giao "hộp đen" (định nghĩa ở phần chẩn đoán bên dưới)
+static void diag_handoff(void);
+// Chứng minh thư của ảnh SẮP CÀI — đọc được từ file .bin ngay lúc bắt đầu tải.
+static char g_incoming_built[40] = "-";
+static char g_incoming_idf[32]   = "-";
 
 // Báo trạng thái OTA ngược lên Firebase để web hiển thị
 // LƯU Ý VỀ Ý NGHĨA CỦA fwVer (chỗ này rất hay bị hiểu nhầm):
@@ -863,6 +868,9 @@ static void ota_hard_reset_after_update(void) {
     ESP_LOGW(TAG, "Da ha GPIO2 ve LOW, cho mach ngoai cat nguon...");
     vTaskDelay(pdMS_TO_TICKS(12000));
     ESP_LOGE(TAG, "Mach reset ngoai KHONG tac dong sau 12s -> dung esp_restart() du phong");
+    // Ghi nhận lại: bo này KHÔNG có (hoặc hỏng) mạch reset ngoài, nên không thể
+    // tạo lần bật nguồn thật. Biết điều này để loại trừ giả thuyết "reset mềm".
+    fb_put(dev_path("/mppt/ota/extResetWorks"), "false");
     esp_restart();
 }
 
@@ -925,10 +933,30 @@ static bool do_ota_update(const char *url) {
         esp_app_desc_t nd;
         if (esp_https_ota_get_img_desc(ota_handle, &nd) == ESP_OK) {
             const esp_app_desc_t *cd = esp_app_get_description();
-            static char ji[300];
-            snprintf(ji, sizeof(ji), "{\"appVer\":\"%s\",\"built\":\"%s %s\"}",
-                     nd.version, nd.date, nd.time);
+            snprintf(g_incoming_built, sizeof(g_incoming_built), "%s %s", nd.date, nd.time);
+            snprintf(g_incoming_idf, sizeof(g_incoming_idf), "%s", nd.idf_ver);
+
+            // Báo kèm PHIÊN BẢN ESP-IDF và TÊN PROJECT của ảnh sắp cài.
+            // Vì sao quan trọng: bootloader nằm trên chip KHÔNG bị OTA thay đổi
+            // (chỉ nạp USB mới thay được). Nếu ảnh .bin được build bằng ESP-IDF
+            // / cấu hình khác với bootloader đang nằm trên chip, app mới sẽ
+            // chạy trên một môi trường không khớp -> chết rất sớm lúc khởi động
+            // (đúng kiểu INT_WDT đang gặp), dù chính file .bin đó nạp thẳng qua
+            // USB lại chạy tốt (vì lúc đó bootloader cũng được thay luôn).
+            static char ji[400];
+            snprintf(ji, sizeof(ji),
+                     "{\"appVer\":\"%s\",\"built\":\"%s %s\",\"idf\":\"%s\",\"proj\":\"%s\"}",
+                     nd.version, nd.date, nd.time, nd.idf_ver, nd.project_name);
             fb_put(dev_path("/mppt/ota/incoming"), ji);
+
+            if (cd && strcmp(cd->idf_ver, nd.idf_ver) != 0) {
+                ESP_LOGE(TAG, "CANH BAO: ban dang chay build bang IDF %s, ban sap cai build bang IDF %s "
+                              "-> KHONG KHOP voi bootloader tren chip, rat de chet luc khoi dong.",
+                         cd->idf_ver, nd.idf_ver);
+                fb_put(dev_path("/mppt/ota/idfMismatch"), "true");
+            } else {
+                fb_put(dev_path("/mppt/ota/idfMismatch"), "false");
+            }
 
             // Lưu RIÊNG ngày-giờ-biên-dịch của ảnh sắp cài để lúc boot lại so
             // sánh NGUYÊN VĂN với ảnh đang chạy — xem mục "KẾT LUẬN LẦN CÀI
@@ -1003,6 +1031,15 @@ static bool do_ota_update(const char *url) {
     // Ở đây phiên trước vừa chạy WiFi + TLS + ghi flash liên tục rồi mới restart,
     // nên trạng thái để lại càng "bẩn". Vì vậy: dùng chính mạch reset ngoài sẵn
     // có (GPIO2) để CẮT NGUỒN thật, tạo ra lần khởi động sạch y hệt khi nạp USB.
+
+    // ★ BÀN GIAO HỘP ĐEN: đặt dấu chân về 0 và ghi tên ảnh SẮP chạy.
+    // Nếu thiếu bước này, dấu chân 9 do CHÍNH ẢNH CŨ để lại vẫn còn nguyên,
+    // nên khi ảnh mới chết sớm (chưa kịp ghi gì) ta lại đọc nhầm thành "ảnh mới
+    // chạy tới bước 9" — đúng cái nhiễu vừa gặp. Sau khi bàn giao:
+    //   step vẫn = 0  -> ảnh mới CHƯA chạy nổi tới nvs_flash_init (chết cực sớm)
+    //   step  > 0     -> ảnh mới đã chạy tới đúng bước đó
+    diag_handoff();
+
     ota_hard_reset_after_update();
     return true;  // không bao giờ tới đây
 }
@@ -1066,6 +1103,18 @@ static void diag_mark(boot_step_t step) {
     if (!g_diag_h) return;
     nvs_set_u8(g_diag_h, "step", (uint8_t)step);
     nvs_commit(g_diag_h);
+}
+
+// Gọi ngay TRƯỚC khi khởi động lại vào ảnh vừa OTA: xoá dấu chân của mình và
+// ghi tên ảnh sắp chạy, để dấu chân đọc được ở lần boot sau chắc chắn là của
+// ảnh MỚI chứ không phải tàn dư của ảnh cũ.
+static void diag_handoff(void) {
+    if (!g_diag_h) return;
+    nvs_set_u8(g_diag_h, "step", 0);
+    nvs_set_str(g_diag_h, "built", g_incoming_built);
+    nvs_set_u8(g_diag_h, "fw", (uint8_t)g_ota_target_ver);
+    nvs_commit(g_diag_h);
+    ESP_LOGW(TAG, "HOP DEN: da ban giao cho anh moi (built %s)", g_incoming_built);
 }
 
 // Gọi NGAY sau nvs_flash_init(): đọc dấu chân cũ rồi đặt dấu chân mới.
