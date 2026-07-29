@@ -441,6 +441,12 @@ typedef enum {
 static volatile led_mode_t g_led_mode = LED_WIFI_LOST;
 static volatile bool g_force_reconnect = false;
 static volatile bool g_ota_in_progress = false;
+// Kết quả THẬT của lần gọi esp_ota_mark_app_valid_cancel_rollback() lúc boot,
+// để đưa vào node chẩn đoán /mppt/ota/build — không đoán suông, đọc lại đúng
+// esp_err_t trả về và trạng thái phân vùng SAU khi gọi, xem có chuyển sang
+// VALID thật hay không.
+static esp_err_t g_ota_mark_err = ESP_ERR_NOT_FINISHED; // NOT_FINISHED = "chưa từng chạy hàm này"
+static esp_ota_img_states_t g_ota_state_after_mark = ESP_OTA_IMG_UNDEFINED;
 static volatile bool g_start_ap_mode   = false;   // true khi admin/boot yêu cầu reset WiFi
 
 // ---- Cực LED: đổi thành 0 nếu LED của bạn sáng khi GPIO ở mức CAO (active-high) ----
@@ -886,6 +892,13 @@ static bool do_ota_update(const char *url) {
             snprintf(ji, sizeof(ji), "{\"appVer\":\"%s\",\"built\":\"%s %s\"}",
                      nd.version, nd.date, nd.time);
             fb_put(dev_path("/mppt/ota/incoming"), ji);
+
+            // Lưu RIÊNG ngày-giờ-biên-dịch của ảnh sắp cài để lúc boot lại so
+            // sánh NGUYÊN VĂN với ảnh đang chạy — xem mục "KẾT LUẬN LẦN CÀI
+            // TRƯỚC" ở app_main để biết vì sao cần tách riêng field này.
+            static char jpb[64];
+            snprintf(jpb, sizeof(jpb), "\"%s %s\"", nd.date, nd.time);
+            fb_put(dev_path("/mppt/ota/pendingBuilt"), jpb);
             ESP_LOGW(TAG, "Anh firmware SAP CAI: ver=%s built=%s %s", nd.version, nd.date, nd.time);
             ESP_LOGW(TAG, "Anh firmware DANG CHAY: ver=%s built=%s %s",
                      cd ? cd->version : "?", cd ? cd->date : "?", cd ? cd->time : "?");
@@ -969,10 +982,23 @@ static void ota_mark_valid_now(void) {
     esp_ota_img_states_t st;
     if (esp_ota_get_state_partition(running, &st) != ESP_OK) return;
     if (st == ESP_OTA_IMG_PENDING_VERIFY) {
-        esp_err_t e = esp_ota_mark_app_valid_cancel_rollback();
-        ESP_LOGW(TAG, "Firmware moi (partition %s) -> XAC NHAN HOP LE ngay luc boot: %s",
-                 running->label, esp_err_to_name(e));
+        g_ota_mark_err = esp_ota_mark_app_valid_cancel_rollback();
+        // ĐỌC LẠI trạng thái NGAY SAU khi gọi — không tin suông vào esp_err_t,
+        // vì (theo đúng lỗi đang gặp) có khả năng lệnh gọi "coi như chạy" mà
+        // trạng thái KHÔNG THỰC SỰ chuyển sang VALID (ví dụ do sdkconfig của
+        // ảnh vừa OTA không bật CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE giống ảnh
+        // đang biên dịch ở đây, hoặc do phân vùng otadata bị bootloader ghi đè
+        // lại ngay sau đó). Đọc lại là cách DUY NHẤT biết chắc có ăn hay không.
+        esp_ota_get_state_partition(running, &g_ota_state_after_mark);
+        ESP_LOGW(TAG, "Firmware moi (partition %s) -> XAC NHAN HOP LE ngay luc boot: %s "
+                      "(trang thai sau khi xac nhan = %d, %s)",
+                 running->label, esp_err_to_name(g_ota_mark_err),
+                 (int)g_ota_state_after_mark,
+                 g_ota_state_after_mark == ESP_OTA_IMG_VALID ? "DA THANH VALID - AN TOAN"
+                                                              : "VAN CHUA VALID - VAN CO NGUY CO ROLLBACK");
     } else {
+        g_ota_mark_err = ESP_OK; // không ở trạng thái pending -> không cần mark, coi như "ổn"
+        g_ota_state_after_mark = st;
         ESP_LOGI(TAG, "Partition dang chay: %s (img_state=%d)", running->label, (int)st);
     }
 }
@@ -1004,11 +1030,12 @@ static void ota_report_build_info(void) {
     snprintf(other_built, sizeof(other_built), "%s %s",
              has_other ? od.date : "-", has_other ? od.time : "");
 
-    static char j[640];
+    static char j[760];
     snprintf(j, sizeof(j),
              "{\"fwVer\":%d,\"part\":\"%s\",\"appVer\":\"%s\",\"built\":\"%s %s\","
              "\"imgState\":%d,\"rollbackEnabled\":%d,\"idf\":\"%s\","
-             "\"otherPart\":\"%s\",\"otherVer\":\"%s\",\"otherBuilt\":\"%s\"}",
+             "\"otherPart\":\"%s\",\"otherVer\":\"%s\",\"otherBuilt\":\"%s\","
+             "\"markValidErr\":\"%s\",\"markValidWorked\":%s}",
              FIRMWARE_VERSION,
              run ? run->label : "?",
              d ? d->version : "?",
@@ -1017,7 +1044,9 @@ static void ota_report_build_info(void) {
              d ? d->idf_ver : "?",
              other ? other->label : "?",
              has_other ? od.version : "-",
-             other_built);
+             other_built,
+             esp_err_to_name(g_ota_mark_err),
+             g_ota_state_after_mark == ESP_OTA_IMG_VALID ? "true" : "false");
     fb_put(dev_path("/mppt/ota/build"), j);
 }
 
@@ -1856,25 +1885,58 @@ void app_main(void) {
         ota_report("idle", 0);
         ota_report_build_info();
 
-        // ---- KẾT LUẬN LẦN CÀI TRƯỚC ----
-        // pull_ota() ghi pendingVersion = bản sắp cài NGAY TRƯỚC khi OTA. Sau khi
-        // khởi động lại, so sánh với version thật đang chạy:
-        //   FIRMWARE_VERSION >= pending -> cài thành công thật ("ok")
-        //   FIRMWARE_VERSION <  pending -> đã bị QUAY LUI ("rollback")
-        // App/web đọc /mppt/ota/lastResult để báo đúng sự thật cho người dùng,
-        // thay vì báo "thành công" rồi version vẫn đứng yên.
+        // ============================================================
+        // ---- KẾT LUẬN LẦN CÀI TRƯỚC (bản sửa lần 2) ----
+        // ============================================================
+        // BẢN CŨ chỉ so #define FIRMWARE_VERSION (số tay, DỄ QUÊN TĂNG khi
+        // build) với pendingVersion -> hễ số thấp hơn là gán luôn nhãn
+        // "rollback", dù có 2 khả năng hoàn toàn khác nhau đứng sau con số đó:
+        //   (1) ROLLBACK THẬT: bootloader đã quay lui, code cũ đang chạy.
+        //   (2) CHỈ LÀ QUÊN TĂNG SỐ: code MỚI vẫn đang chạy đúng (đổi phân
+        //       vùng thành công), nhưng người viết code quên sửa
+        //       #define FIRMWARE_VERSION trước khi build, nên con số báo sai.
+        // Hai trường hợp cần 2 cách xử lý hoàn toàn khác nhau, nên PHẢI phân
+        // biệt được — không thể chỉ dựa vào con số tay để kết luận.
+        //
+        // CÁCH PHÂN BIỆT: so NGUYÊN VĂN ngày-giờ-biên-dịch (built) của ảnh
+        // ĐANG CHẠY (do trình biên dịch tự nhúng, không ai gõ tay được) với
+        // built của ảnh đã lưu ở pendingBuilt NGAY TRƯỚC lúc OTA:
+        //   - built KHỚP  -> code mới CHẮC CHẮN đang chạy thật.
+        //   - built KHÔNG khớp -> code đang chạy KHÔNG PHẢI ảnh vừa tải ->
+        //     ROLLBACK THẬT.
         static char pvbuf[32];
         int pending = 0;
         if (fb_get(dev_path("/mppt/ota/pendingVersion"), pvbuf, sizeof(pvbuf))) {
             pending = atoi(pvbuf);
         }
         if (pending > 0) {
-            if (FIRMWARE_VERSION >= pending) {
+            static char pendingBuiltBuf[64];
+            bool haveExpected =
+                fb_get(dev_path("/mppt/ota/pendingBuilt"), pendingBuiltBuf, sizeof(pendingBuiltBuf))
+                && strlen(pendingBuiltBuf) > 2;
+
+            const esp_app_desc_t *cur = esp_app_get_description();
+            char curBuiltQ[72]; // cùng định dạng có ngoặc kép như lúc PUT ở pendingBuilt
+            snprintf(curBuiltQ, sizeof(curBuiltQ), "\"%s %s\"",
+                      cur ? cur->date : "?", cur ? cur->time : "?");
+
+            bool codeMatches = haveExpected && strcmp(curBuiltQ, pendingBuiltBuf) == 0;
+
+            if (codeMatches && FIRMWARE_VERSION >= pending) {
                 fb_put(dev_path("/mppt/ota/lastResult"), "\"ok\"");
-                ESP_LOGW(TAG, "OTA: da chay dung ban v%d", FIRMWARE_VERSION);
+                ESP_LOGW(TAG, "OTA: da chay dung ban v%d (built khop pendingBuilt)", FIRMWARE_VERSION);
+            } else if (codeMatches) {
+                // Code MỚI đang chạy thật (ngày giờ biên dịch khớp file vừa
+                // tải) nhưng FIRMWARE_VERSION vẫn < pending -> KHÔNG PHẢI
+                // rollback, chỉ là quên tăng số trong code trước khi build.
+                fb_put(dev_path("/mppt/ota/lastResult"), "\"version_macro_forgotten\"");
+                ESP_LOGE(TAG, "OTA: code MOI dang chay THAT (built khop) nhung "
+                              "FIRMWARE_VERSION van la %d (< %d) -> QUEN TANG SO "
+                              "TRONG CODE, KHONG PHAI rollback.", FIRMWARE_VERSION, pending);
             } else {
                 fb_put(dev_path("/mppt/ota/lastResult"), "\"rollback\"");
-                ESP_LOGE(TAG, "OTA: yeu cau v%d nhung dang chay v%d -> DA BI ROLLBACK",
+                ESP_LOGE(TAG, "OTA: yeu cau v%d nhung dang chay v%d VA built KHONG KHOP "
+                              "ban vua tai -> DA BI BOOTLOADER ROLLBACK THAT SU",
                          pending, FIRMWARE_VERSION);
             }
             fb_put(dev_path("/mppt/ota/pendingVersion"), "0");
