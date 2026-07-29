@@ -23,6 +23,13 @@
 # đúng vị trí bootloader thật -> esp_https_ota đọc trúng vùng đệm trống đó,
 # báo "Mismatch chip id... found 65535 (=0xFFFF)". Đây là lỗi khái niệm, không
 # phải lỗi Git/lỗi mạng như các giả thuyết trước.
+#
+# ============================================================
+# PHIÊN BẢN ESP-IDF PHẢI TRÙNG VỚI BOOTLOADER ĐANG NẰM TRÊN CHIP
+#   Bootloader KHÔNG BAO GIỜ được thay qua OTA — chỉ nạp cáp USB mới thay được.
+#   App build bằng IDF khác dòng sẽ chạy trên môi trường khởi động không khớp
+#   và chết ngay lúc boot (INT_WDT), rồi bị bootloader quay lui. Firmware đã có
+#   lớp chặn: đọc idf_ver trong file .bin và TỪ CHỐI cài nếu khác major.minor.
 # ============================================================
 
 name: Build & Release Firmware
@@ -45,7 +52,26 @@ jobs:
       - name: Lấy code từ repo
         uses: actions/checkout@v4
 
-      - name: Build bằng ESP-IDF (v5.5 trở lên mới hỗ trợ chính thức ESP32-C5)
+      # ============================================================
+      # CHỐT CHẶN CẤU HÌNH: file `sdkconfig` bị .gitignore nên KHÔNG lên GitHub.
+      # Nếu thiếu `sdkconfig.defaults`, CI sẽ build bằng TOÀN BỘ giá trị mặc
+      # định — khác hẳn cấu hình trong menuconfig ở máy, và cho ra firmware
+      # trông "build thành công" nhưng chạy sai (ví dụ: bộ chứng chỉ gốc rút
+      # gọn -> mất kết nối Firebase, stack main task quá nhỏ -> tràn stack).
+      # Dừng ngay ở đây còn hơn phát hành một bản .bin hỏng.
+      # ============================================================
+      - name: Kiểm tra sdkconfig.defaults có tồn tại
+        run: |
+          if [ ! -f sdkconfig.defaults ]; then
+            echo "::error::Thieu sdkconfig.defaults. Chay 'idf.py save-defconfig' o may roi commit file do."
+            exit 1
+          fi
+          echo "### ⚙️ Cấu hình build (sdkconfig.defaults)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -v '^\s*#' sdkconfig.defaults | grep -v '^\s*$' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Build bằng ESP-IDF (phải TRÙNG phiên bản với bootloader trên chip)
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version:  v6.0.2  
@@ -60,6 +86,11 @@ jobs:
             cp build/esp32c5_Batt_v0.bin firmware_app.bin
             cd build
             esptool.py --chip esp32c5 merge_bin -o ../firmware_full.bin @flash_args
+            cd ..
+            # In ra vài mục cấu hình QUYẾT ĐỊNH của bản build thật (đọc từ
+            # sdkconfig do CI sinh ra), để đối chiếu nhanh khi có sự cố.
+            echo "----- CAU HINH THAT SU DUOC BUILD -----"
+            grep -E 'CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT|CONFIG_ESP_MAIN_TASK_STACK_SIZE|CONFIG_PARTITION_TABLE|CONFIG_ESPTOOLPY_FLASHSIZE=|CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE' sdkconfig || true
 
       - name: Đặt tên file kèm số phiên bản
         run: |

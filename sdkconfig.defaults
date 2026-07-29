@@ -1,16 +1,11 @@
-# ===== Partition table tùy chỉnh cho OTA (2 slot) =====
+# This file was generated using idf.py save-defconfig or menuconfig [D] key. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 6.0.2 Project Minimal Configuration
+#
+# default:
+CONFIG_IDF_TARGET="esp32c5"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv"
-CONFIG_PARTITION_TABLE_FILENAME="partitions_ota.csv"
-
-# ===== Kích thước flash: đặt 4MB (đổi thành 8MB nếu board bạn có 8MB) =====
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
-
-# ===== Bật cơ chế rollback tự động =====
-# Nếu firmware mới không tự gọi esp_ota_mark_app_valid_cancel_rollback()
-# trong lần khởi động đầu tiên, bootloader sẽ tự quay về firmware cũ.
-CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
-
-# ===== Cho phép HTTPS OTA đọc kích thước ảnh động =====
-CONFIG_ESP_HTTPS_OTA_DECRYPT_CB=n
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
