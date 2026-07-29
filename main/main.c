@@ -98,7 +98,7 @@ static void device_id_init(void) {
 #define FIREBASE_HOST "https://battery-solar-system-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 // ---- OTA: phiên bản firmware hiện tại (tăng số này mỗi lần phát hành bản mới) ----
-#define FIRMWARE_VERSION 1
+#define FIRMWARE_VERSION 2
 
 // Link firmware mặc định (đóng cứng trong code) — dùng làm giá trị khởi tạo cho những thiết bị
 // CHƯA từng được Admin cấu hình link OTA riêng trên Firebase. Admin vẫn có thể đổi link này
@@ -931,7 +931,24 @@ static bool do_ota_update(const char *url) {
     // nhất. Bắt được ở đây thì báo lỗi rõ ràng thay vì cài rồi ngơ ngác.
     {
         esp_app_desc_t nd;
-        if (esp_https_ota_get_img_desc(ota_handle, &nd) == ESP_OK) {
+        esp_err_t derr = esp_https_ota_get_img_desc(ota_handle, &nd);
+        if (derr != ESP_OK) {
+            // Không đọc nổi "chứng minh thư" app -> file này KHÔNG PHẢI ảnh app
+            // thuần. Gần như chắc chắn là file _full.bin (đã gộp bootloader +
+            // bảng phân vùng + app, chỉ dùng để nạp USB ở offset 0x0). Nếu cứ
+            // cài, thiết bị sẽ ghi bootloader vào vùng app -> HỎNG HẲN, phải
+            // tháo máy nạp lại bằng cáp. Chặn ngay tại đây.
+            ESP_LOGE(TAG, "TU CHOI OTA: file .bin khong co app descriptor (%s). "
+                          "Rat co the ban da dien nham link _full.bin — link OTA "
+                          "PHAI la file _app.bin.", esp_err_to_name(derr));
+            esp_https_ota_abort(ota_handle);
+            fb_put(dev_path("/mppt/ota/lastResult"), "\"not_app_image\"");
+            fb_put(dev_path("/mppt/ota/pendingVersion"), "0");
+            ota_report("failed", 0);
+            g_ota_in_progress = false;
+            return false;
+        }
+        {
             const esp_app_desc_t *cd = esp_app_get_description();
             snprintf(g_incoming_built, sizeof(g_incoming_built), "%s %s", nd.date, nd.time);
             snprintf(g_incoming_idf, sizeof(g_incoming_idf), "%s", nd.idf_ver);
@@ -949,13 +966,28 @@ static bool do_ota_update(const char *url) {
                      nd.version, nd.date, nd.time, nd.idf_ver, nd.project_name);
             fb_put(dev_path("/mppt/ota/incoming"), ji);
 
-            if (cd && strcmp(cd->idf_ver, nd.idf_ver) != 0) {
-                ESP_LOGE(TAG, "CANH BAO: ban dang chay build bang IDF %s, ban sap cai build bang IDF %s "
-                              "-> KHONG KHOP voi bootloader tren chip, rat de chet luc khoi dong.",
-                         cd->idf_ver, nd.idf_ver);
-                fb_put(dev_path("/mppt/ota/idfMismatch"), "true");
-            } else {
-                fb_put(dev_path("/mppt/ota/idfMismatch"), "false");
+            // ★ CHẶN CỨNG KHI KHÁC PHIÊN BẢN ESP-IDF (khác major.minor).
+            // Bootloader nằm trên chip KHÔNG BAO GIỜ bị OTA thay đổi — chỉ nạp
+            // qua cáp USB mới thay được. App build bằng IDF khác dòng sẽ chạy
+            // trên môi trường khởi động không khớp và chết ngay (INT_WDT), rồi
+            // bị bootloader quay lui. Cài vào chỉ tốn thời gian và làm bộ sạc
+            // ngừng vô ích, nên TỪ CHỐI ngay từ đầu thay vì cài rồi thất bại.
+            int cmaj = 0, cmin = 0, nmaj = 0, nmin = 0;
+            if (cd) sscanf(cd->idf_ver, "v%d.%d", &cmaj, &cmin);
+            sscanf(nd.idf_ver, "v%d.%d", &nmaj, &nmin);
+            bool idf_mismatch = (cd != NULL) && (cmaj != nmaj || cmin != nmin);
+            fb_put(dev_path("/mppt/ota/idfMismatch"), idf_mismatch ? "true" : "false");
+            if (idf_mismatch) {
+                ESP_LOGE(TAG, "TU CHOI OTA: thiet bi dang chay IDF %s (bootloader cung dong nay), "
+                              "nhung file .bin duoc build bang IDF %s. Phai build lai file .bin "
+                              "bang DUNG IDF %s, hoac nap file _full.bin qua cap USB.",
+                         cd->idf_ver, nd.idf_ver, cd->idf_ver);
+                esp_https_ota_abort(ota_handle);
+                fb_put(dev_path("/mppt/ota/lastResult"), "\"idf_mismatch\"");
+                fb_put(dev_path("/mppt/ota/pendingVersion"), "0");
+                ota_report("failed", 0);
+                g_ota_in_progress = false;
+                return false;
             }
 
             // Lưu RIÊNG ngày-giờ-biên-dịch của ảnh sắp cài để lúc boot lại so
