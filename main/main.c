@@ -825,6 +825,15 @@ static void ota_report(const char *state, int progress) {
 
 // Thực hiện OTA từ 1 URL .bin. Trả về true nếu thành công (sẽ reboot ngay sau đó).
 static bool do_ota_update(const char *url) {
+    // CHỐNG CACHE CDN: raw.githubusercontent.com giữ bản cũ trong bộ nhớ đệm
+    // tới ~5 phút sau khi push file mới. Vừa upload xong mà OTA ngay thì rất dễ
+    // tải trúng bản CŨ -> cài "thành công" nhưng version không đổi.
+    // Thêm tham số ?t=<giây> làm khoá cache khác nhau mỗi lần -> luôn lấy bản mới.
+    char url_nc[440];
+    if (strchr(url, '?') == NULL) {
+        snprintf(url_nc, sizeof(url_nc), "%s?t=%ld", url, (long)time(NULL));
+        url = url_nc;
+    }
     ESP_LOGW(TAG, "=== BAT DAU OTA tu URL: %s ===", url);
 
     // 1) Tạm dừng sạc để an toàn: bật cờ, chờ mppt_task nhả PWM về 0
@@ -859,6 +868,39 @@ static bool do_ota_update(const char *url) {
         ota_report("failed", 0);
         g_ota_in_progress = false;
         return false;
+    }
+
+    // ★ 1b) ĐỌC "CHỨNG MINH THƯ" CỦA ẢNH SẮP CÀI, TRƯỚC KHI GHI ĐÈ.
+    // esp_https_ota_get_img_desc() lấy được esp_app_desc_t nằm ở đầu file .bin
+    // đang tải (tên project, chuỗi version, NGÀY + GIỜ BIÊN DỊCH).
+    // Mục đích: nếu file trên GitHub thực chất VẪN LÀ BẢN CŨ (quên build lại,
+    // quên push, hoặc CDN raw.githubusercontent.com còn trả bản cache cũ ~5
+    // phút), thì ngày giờ biên dịch sẽ TRÙNG KHÍT với bản đang chạy. Khi đó
+    // OTA vẫn "thành công" nhưng version đứng yên — đúng hiện tượng khó hiểu
+    // nhất. Bắt được ở đây thì báo lỗi rõ ràng thay vì cài rồi ngơ ngác.
+    {
+        esp_app_desc_t nd;
+        if (esp_https_ota_get_img_desc(ota_handle, &nd) == ESP_OK) {
+            const esp_app_desc_t *cd = esp_app_get_description();
+            static char ji[300];
+            snprintf(ji, sizeof(ji), "{\"appVer\":\"%s\",\"built\":\"%s %s\"}",
+                     nd.version, nd.date, nd.time);
+            fb_put(dev_path("/mppt/ota/incoming"), ji);
+            ESP_LOGW(TAG, "Anh firmware SAP CAI: ver=%s built=%s %s", nd.version, nd.date, nd.time);
+            ESP_LOGW(TAG, "Anh firmware DANG CHAY: ver=%s built=%s %s",
+                     cd ? cd->version : "?", cd ? cd->date : "?", cd ? cd->time : "?");
+
+            if (cd && strcmp(cd->date, nd.date) == 0 && strcmp(cd->time, nd.time) == 0) {
+                ESP_LOGE(TAG, "File .bin tren server GIONG HET ban dang chay "
+                              "(cung ngay gio bien dich) -> HUY OTA, khong cai lai vo ich.");
+                esp_https_ota_abort(ota_handle);
+                fb_put(dev_path("/mppt/ota/lastResult"), "\"same_build\"");
+                fb_put(dev_path("/mppt/ota/pendingVersion"), "0");
+                ota_report("failed", 0);
+                g_ota_in_progress = false;
+                return false;
+            }
+        }
     }
 
     // 2) Tải và ghi từng khối; báo tiến độ %
@@ -946,16 +988,36 @@ static void ota_report_build_info(void) {
     const esp_app_desc_t *d = esp_app_get_description();
     esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
     if (run) esp_ota_get_state_partition(run, &st);
-    static char j[420];
+#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    const int rb = 1;
+#else
+    const int rb = 0;
+#endif
+    // Đọc luôn "chứng minh thư" của ảnh nằm ở PHÂN VÙNG CÒN LẠI (chính là ảnh
+    // vừa OTA về). So ngày giờ biên dịch của nó với ảnh đang chạy là biết ngay
+    // file .bin trên GitHub có đúng bản mới hay không.
+    esp_app_desc_t od;
+    bool has_other = false;
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    if (other && esp_ota_get_partition_description(other, &od) == ESP_OK) has_other = true;
+    char other_built[48];
+    snprintf(other_built, sizeof(other_built), "%s %s",
+             has_other ? od.date : "-", has_other ? od.time : "");
+
+    static char j[640];
     snprintf(j, sizeof(j),
              "{\"fwVer\":%d,\"part\":\"%s\",\"appVer\":\"%s\",\"built\":\"%s %s\","
-             "\"imgState\":%d,\"idf\":\"%s\"}",
+             "\"imgState\":%d,\"rollbackEnabled\":%d,\"idf\":\"%s\","
+             "\"otherPart\":\"%s\",\"otherVer\":\"%s\",\"otherBuilt\":\"%s\"}",
              FIRMWARE_VERSION,
              run ? run->label : "?",
              d ? d->version : "?",
              d ? d->date : "?", d ? d->time : "?",
-             (int)st,
-             d ? d->idf_ver : "?");
+             (int)st, rb,
+             d ? d->idf_ver : "?",
+             other ? other->label : "?",
+             has_other ? od.version : "-",
+             other_built);
     fb_put(dev_path("/mppt/ota/build"), j);
 }
 
@@ -1733,13 +1795,14 @@ static void pull_ota(void) {
 //   11. APP MAIN
 // ============================================================
 void app_main(void) {
+    // ★★★ DÒNG ĐẦU TIÊN TUYỆT ĐỐI. Chỉ đụng vào phân vùng otadata, không cần
+    //     NVS/RAM/WiFi gì cả. Đặt trước cả ram_reserve_init()/nvs_flash_init()
+    //     để dù các bước khởi tạo đó có lỗi & reboot thì bản firmware vừa OTA
+    //     VẪN đã được xác nhận hợp lệ, không bị bootloader quay lui.
+    ota_mark_valid_now();
+
     ram_reserve_init();         // KHOÁ 10% RAM ngay dòng đầu tiên — giữ nguyên suốt vòng đời chương trình
     nvs_flash_init();
-
-    // ★ PHẢI GỌI SỚM NHẤT CÓ THỂ — trước mọi thứ có thể gây reboot (WiFi lỗi,
-    //   NTP lỗi -> request_external_reset). Nếu chậm, bootloader sẽ rollback
-    //   bản firmware vừa OTA về bản cũ và mọi lần cập nhật đều "thành công giả".
-    ota_mark_valid_now();
     nvs_load_all();
     adc_setup();
     pwm_setup();
