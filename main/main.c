@@ -37,6 +37,7 @@
 #include "esp_https_ota.h"    // <-- OTA qua HTTPS
 #include "esp_ota_ops.h"      // <-- rollback / xác nhận firmware
 #include "esp_app_desc.h"     // <-- đọc mô tả app đang chạy (version/ngày build) để chẩn đoán OTA
+#include "esp_system.h"       // <-- esp_reset_reason(): biết lần reset trước là do crash hay chủ động
 #include "esp_heap_caps.h"
 
 #include "nvs_flash.h"
@@ -447,6 +448,15 @@ static volatile bool g_ota_in_progress = false;
 // VALID thật hay không.
 static esp_err_t g_ota_mark_err = ESP_ERR_NOT_FINISHED; // NOT_FINISHED = "chưa từng chạy hàm này"
 static esp_ota_img_states_t g_ota_state_after_mark = ESP_OTA_IMG_UNDEFINED;
+// CÓ THỰC SỰ phải xác nhận hay không. Phân biệt 2 chuyện rất dễ nhầm:
+//   - wasPending = true  : ảnh này VỪA ĐƯỢC OTA, cần xác nhận -> con số
+//                          markValidWorked mới có ý nghĩa.
+//   - wasPending = false : ảnh này nạp bằng USB (luôn VALID sẵn) -> lúc này
+//                          markValidWorked=true KHÔNG chứng minh được điều gì
+//                          về ảnh vừa OTA cả. Bản trước thiếu cờ này nên nhìn
+//                          "markValidWorked: true" rất dễ tưởng nhầm là ảnh mới
+//                          đã tự xác nhận thành công.
+static bool g_ota_was_pending_at_boot = false;
 static volatile bool g_start_ap_mode   = false;   // true khi admin/boot yêu cầu reset WiFi
 
 // ---- Cực LED: đổi thành 0 nếu LED của bạn sáng khi GPIO ở mức CAO (active-high) ----
@@ -982,6 +992,7 @@ static void ota_mark_valid_now(void) {
     esp_ota_img_states_t st;
     if (esp_ota_get_state_partition(running, &st) != ESP_OK) return;
     if (st == ESP_OTA_IMG_PENDING_VERIFY) {
+        g_ota_was_pending_at_boot = true;
         g_ota_mark_err = esp_ota_mark_app_valid_cancel_rollback();
         // ĐỌC LẠI trạng thái NGAY SAU khi gọi — không tin suông vào esp_err_t,
         // vì (theo đúng lỗi đang gặp) có khả năng lệnh gọi "coi như chạy" mà
@@ -1026,6 +1037,15 @@ static void ota_report_build_info(void) {
     bool has_other = false;
     const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
     if (other && esp_ota_get_partition_description(other, &od) == ESP_OK) has_other = true;
+    // Trạng thái của ảnh nằm ở phân vùng kia. Nếu = 4 (ESP_OTA_IMG_ABORTED) thì
+    // chính bootloader đã TỪ CHỐI ảnh đó và quay lui — bằng chứng trực tiếp,
+    // không cần suy đoán.
+    esp_ota_img_states_t ost = ESP_OTA_IMG_UNDEFINED;
+    if (other) esp_ota_get_state_partition(other, &ost);
+    // Lý do của lần reset gần nhất: 6=PANIC(code lỗi/crash), 7=INT_WDT,
+    // 8=TASK_WDT, 9=WDT, 11=BROWNOUT(sụt áp), 3=SW(esp_restart), 1=POWERON.
+    // Nếu ảnh mới vừa boot lên đã crash thì giá trị này chỉ thẳng ra nguyên nhân.
+    const int rst = (int)esp_reset_reason();
     char other_built[48];
     snprintf(other_built, sizeof(other_built), "%s %s",
              has_other ? od.date : "-", has_other ? od.time : "");
@@ -1035,7 +1055,8 @@ static void ota_report_build_info(void) {
              "{\"fwVer\":%d,\"part\":\"%s\",\"appVer\":\"%s\",\"built\":\"%s %s\","
              "\"imgState\":%d,\"rollbackEnabled\":%d,\"idf\":\"%s\","
              "\"otherPart\":\"%s\",\"otherVer\":\"%s\",\"otherBuilt\":\"%s\","
-             "\"markValidErr\":\"%s\",\"markValidWorked\":%s}",
+             "\"markValidErr\":\"%s\",\"markValidWorked\":%s,"
+             "\"wasPendingAtBoot\":%s,\"otherState\":%d,\"resetReason\":%d}",
              FIRMWARE_VERSION,
              run ? run->label : "?",
              d ? d->version : "?",
@@ -1046,7 +1067,9 @@ static void ota_report_build_info(void) {
              has_other ? od.version : "-",
              other_built,
              esp_err_to_name(g_ota_mark_err),
-             g_ota_state_after_mark == ESP_OTA_IMG_VALID ? "true" : "false");
+             g_ota_state_after_mark == ESP_OTA_IMG_VALID ? "true" : "false",
+             g_ota_was_pending_at_boot ? "true" : "false",
+             (int)ost, rst);
     fb_put(dev_path("/mppt/ota/build"), j);
 }
 
