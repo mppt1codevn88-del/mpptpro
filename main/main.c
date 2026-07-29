@@ -850,6 +850,22 @@ static void ota_report(const char *state, int progress) {
     fb_put(dev_path("/mppt/ota/status"), j);
 }
 
+// Reset CỨNG bằng mạch ngoài (GPIO2) để có một lần bật nguồn thật sự.
+// Trình tự đúng bằng máy trạng thái xung reset ở vòng lặp chính: giữ HIGH 3s,
+// hạ LOW để kích sườn xuống, rồi chờ mạch ngoài cắt nguồn.
+// Nếu bo không gắn mạch reset ngoài (hoặc mạch không tác động) thì sau 12 giây
+// vẫn còn sống -> quay về esp_restart() dự phòng để chắc chắn vào firmware mới.
+static void ota_hard_reset_after_update(void) {
+    ESP_LOGW(TAG, "Kich mach reset NGOAI de vao firmware moi bang mot lan bat nguon that su...");
+    gpio_set_level(PIN_EXT_RESET_OUT, 1);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    gpio_set_level(PIN_EXT_RESET_OUT, 0);   // sườn xuống = lệnh cắt nguồn
+    ESP_LOGW(TAG, "Da ha GPIO2 ve LOW, cho mach ngoai cat nguon...");
+    vTaskDelay(pdMS_TO_TICKS(12000));
+    ESP_LOGE(TAG, "Mach reset ngoai KHONG tac dong sau 12s -> dung esp_restart() du phong");
+    esp_restart();
+}
+
 // Thực hiện OTA từ 1 URL .bin. Trả về true nếu thành công (sẽ reboot ngay sau đó).
 static bool do_ota_update(const char *url) {
     // CHỐNG CACHE CDN: raw.githubusercontent.com giữ bản cũ trong bộ nhớ đệm
@@ -974,7 +990,20 @@ static bool do_ota_update(const char *url) {
     ESP_LOGW(TAG, "=== OTA THANH CONG - khoi dong lai vao firmware moi ===");
     ota_report("success", 100);
     vTaskDelay(pdMS_TO_TICKS(1000));   // cho lệnh report kịp gửi lên Firebase
-    esp_restart();
+
+    // ★★★ KHÔNG DÙNG esp_restart() NỮA ★★★
+    //
+    // Manh mối quyết định: CÙNG file .bin đó, nạp thẳng qua USB thì chạy tốt,
+    // nhưng vào bằng OTA thì chết (resetReason=7, INT_WDT). Hai đường đó khác
+    // nhau đúng một điểm về phần cứng: nạp USB kết thúc bằng một lần BẬT NGUỒN
+    // THẬT SỰ (power-on reset, toàn bộ chip kể cả khối RTC/LP về mặc định),
+    // còn esp_restart() chỉ là RESET MỀM (rst:0xc SW_CPU) — khối RTC/LP, một số
+    // thanh ghi và trạng thái ngoại vi vẫn giữ nguyên từ phiên trước.
+    //
+    // Ở đây phiên trước vừa chạy WiFi + TLS + ghi flash liên tục rồi mới restart,
+    // nên trạng thái để lại càng "bẩn". Vì vậy: dùng chính mạch reset ngoài sẵn
+    // có (GPIO2) để CẮT NGUỒN thật, tạo ra lần khởi động sạch y hệt khi nạp USB.
+    ota_hard_reset_after_update();
     return true;  // không bao giờ tới đây
 }
 
@@ -997,6 +1026,75 @@ static bool do_ota_update(const char *url) {
 //  mạng). Firmware đã tự bảo vệ bằng cơ chế reset ngoài + watchdog riêng rồi,
 //  không cần dựa vào rollback của bootloader.
 // ============================================================
+// ============================================================
+//  HỘP ĐEN CHẨN ĐOÁN KHỞI ĐỘNG ("breadcrumb" lưu trong NVS)
+// ============================================================
+//  Vì sao cần: khi ảnh vừa OTA chết lúc khởi động, cổng USB-Serial-JTAG rớt
+//  theo (ClearCommError) nên KHÔNG THỂ đọc được log của nó — mà đó lại đúng là
+//  đoạn log cần nhất. Không phải ai cũng có sẵn mạch USB-TTL để cắm vào UART0.
+//
+//  Cách làm: mỗi mốc khởi động, firmware ghi 1 con số vào NVS (tồn tại qua mọi
+//  kiểu reset, kể cả rollback). Ảnh nào boot lên sau — kể cả ảnh CŨ sau khi
+//  bootloader quay lui — đều đọc lại được dấu chân cuối cùng mà ảnh trước để
+//  lại, rồi đẩy lên Firebase. Nhìn con số đó là biết ảnh mới chết ở BƯỚC NÀO.
+//
+//  Ghi kèm ngày-giờ-biên-dịch của ảnh ĐÃ GHI dấu chân, để phân biệt chắc chắn
+//  dấu chân đó do ảnh MỚI hay ảnh CŨ để lại (2 ảnh khác build khác nhau).
+//
+//  Chi phí flash: ~9 lần ghi NVS mỗi lần khởi động, không đáng kể.
+// ============================================================
+#define DIAG_NS "otadiag"
+typedef enum {
+    BOOT_STEP_NVS_READY      = 1,  // đã qua nvs_flash_init + nvs_load_all
+    BOOT_STEP_MARK_VALID     = 2,  // đã qua ota_mark_valid_now
+    BOOT_STEP_PERIPH         = 3,  // đã qua adc_setup + pwm_setup
+    BOOT_STEP_TASKS          = 4,  // đã tạo xong led/bootbtn/mppt task
+    BOOT_STEP_WIFI_INIT      = 5,  // đã qua wifi_init + device_id_init
+    BOOT_STEP_WIFI_UP        = 6,  // WiFi đã kết nối
+    BOOT_STEP_NTP_OK         = 7,  // NTP đồng bộ xong
+    BOOT_STEP_FB_REPORTED    = 8,  // đã đẩy được dữ liệu lên Firebase
+    BOOT_STEP_MAIN_LOOP      = 9,  // đã vào vòng lặp chính, coi như sống ổn
+} boot_step_t;
+
+static nvs_handle_t g_diag_h = 0;
+// Dấu chân của LẦN BOOT TRƯỚC (đọc ra trước khi ghi đè bằng dấu chân của mình)
+static int  g_prev_step = 0;
+static int  g_prev_fw   = 0;
+static char g_prev_built[40] = "-";
+
+static void diag_mark(boot_step_t step) {
+    if (!g_diag_h) return;
+    nvs_set_u8(g_diag_h, "step", (uint8_t)step);
+    nvs_commit(g_diag_h);
+}
+
+// Gọi NGAY sau nvs_flash_init(): đọc dấu chân cũ rồi đặt dấu chân mới.
+static void diag_begin(void) {
+    if (nvs_open(DIAG_NS, NVS_READWRITE, &g_diag_h) != ESP_OK) {
+        g_diag_h = 0;
+        return;
+    }
+    uint8_t st = 0, fw = 0;
+    if (nvs_get_u8(g_diag_h, "step", &st) == ESP_OK) g_prev_step = st;
+    if (nvs_get_u8(g_diag_h, "fw",   &fw) == ESP_OK) g_prev_fw   = fw;
+    size_t len = sizeof(g_prev_built);
+    if (nvs_get_str(g_diag_h, "built", g_prev_built, &len) != ESP_OK) {
+        strcpy(g_prev_built, "-");
+    }
+
+    // Ghi "chứng minh thư" của ảnh ĐANG chạy để lần sau biết dấu chân của ai
+    const esp_app_desc_t *d = esp_app_get_description();
+    char mine[40];
+    snprintf(mine, sizeof(mine), "%s %s", d ? d->date : "?", d ? d->time : "?");
+    nvs_set_str(g_diag_h, "built", mine);
+    nvs_set_u8(g_diag_h, "fw", (uint8_t)FIRMWARE_VERSION);
+    nvs_set_u8(g_diag_h, "step", (uint8_t)BOOT_STEP_NVS_READY);
+    nvs_commit(g_diag_h);
+
+    ESP_LOGW(TAG, "HOP DEN: lan boot truoc dung o BUOC %d (fw v%d, built %s)",
+             g_prev_step, g_prev_fw, g_prev_built);
+}
+
 static void ota_mark_valid_now(void) {
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (!running) return;
@@ -1867,9 +1965,12 @@ void app_main(void) {
 
     ram_reserve_init();         // KHOÁ 10% RAM ngay dòng đầu tiên — giữ nguyên suốt vòng đời chương trình
     nvs_flash_init();
+    diag_begin();               // HỘP ĐEN: đọc dấu chân lần boot trước + đặt dấu chân mới
     nvs_load_all();
+    diag_mark(BOOT_STEP_MARK_VALID);
     adc_setup();
     pwm_setup();
+    diag_mark(BOOT_STEP_PERIPH);
 
     // Khởi tạo đèn báo trạng thái + nút BOOT
     led_init();
@@ -1881,12 +1982,15 @@ void app_main(void) {
     xTaskCreate(boot_btn_task, "bootbtn", 2560, NULL, 4, NULL);
 
     xTaskCreatePinnedToCore(mppt_task, "mppt", 8192, NULL, 5, NULL, 0);
+    diag_mark(BOOT_STEP_TASKS);
 
     wifi_init();
     device_id_init();   // đọc MAC sau khi WiFi stack đã khởi tạo
+    diag_mark(BOOT_STEP_WIFI_INIT);
     ESP_LOGI(TAG, "Dang cho WiFi ket noi...");
     int wait = 0;
     while (!g_wifi_connected && wait < 30) { vTaskDelay(pdMS_TO_TICKS(500)); wait++; }
+    if (g_wifi_connected) diag_mark(BOOT_STEP_WIFI_UP);
 
     if (!g_wifi_connected) {
         // Không có WiFi thì chắc chắn không thể đồng bộ NTP hay nói chuyện với Firebase được —
@@ -1901,7 +2005,7 @@ void app_main(void) {
             ntp_init(ntp_servers[i]);
             esp_err_t ntp_err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(8000));
             ESP_LOGI(TAG, "Ket qua server %s: %s", ntp_servers[i], esp_err_to_name(ntp_err));
-            if (ntp_err == ESP_OK) { g_ntp_ok = true; break; }
+            if (ntp_err == ESP_OK) { g_ntp_ok = true; diag_mark(BOOT_STEP_NTP_OK); break; }
             esp_netif_sntp_deinit();
         }
         if (!g_ntp_ok) {
@@ -1919,6 +2023,22 @@ void app_main(void) {
         fb_put(dev_path("/mppt/ota/currentVersion"), jv);
         ota_report("idle", 0);
         ota_report_build_info();
+
+        // HỘP ĐEN: đẩy dấu chân của LẦN BOOT TRƯỚC lên Firebase. Nếu ảnh vừa
+        // OTA chết lúc khởi động, đây là cách DUY NHẤT (không cần mạch USB-TTL)
+        // để biết nó chết ở bước nào:
+        //   1=xong NVS  2=xong xac nhan OTA  3=xong ADC/PWM  4=xong tao task
+        //   5=xong wifi_init  6=WiFi len  7=NTP xong  8=day duoc Firebase
+        //   9=vao vong lap chinh (song on)
+        // prevBuilt cho biết dấu chân đó do ẢNH NÀO để lại (so với otherBuilt).
+        {
+            static char jd[240];
+            snprintf(jd, sizeof(jd),
+                     "{\"prevStep\":%d,\"prevFw\":%d,\"prevBuilt\":\"%s\",\"resetReason\":%d}",
+                     g_prev_step, g_prev_fw, g_prev_built, (int)esp_reset_reason());
+            fb_put(dev_path("/mppt/ota/lastBoot"), jd);
+        }
+        diag_mark(BOOT_STEP_FB_REPORTED);
 
         // ============================================================
         // ---- KẾT LUẬN LẦN CÀI TRƯỚC (bản sửa lần 2) ----
@@ -1984,6 +2104,8 @@ void app_main(void) {
     unsigned long last_pull_cfg=0, last_pull_ctrl=0, last_stat_save=0, last_energy=0, last_beat=0;
     unsigned long last_pull_ota=0;
     unsigned long boot_ok_time=0;  // mốc thời gian để xác nhận firmware chạy ổn định (rollback)
+
+    diag_mark(BOOT_STEP_MAIN_LOOP);
 
     for (;;) {
         uint64_t current_time = esp_timer_get_time();
