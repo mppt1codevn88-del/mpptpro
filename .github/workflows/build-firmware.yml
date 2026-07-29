@@ -48,7 +48,7 @@ jobs:
       - name: Build bằng ESP-IDF (v5.5 trở lên mới hỗ trợ chính thức ESP32-C5)
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.5
+          esp_idf_version:  v6.0.2  
           target: esp32c5
           # LƯU Ý CÚ PHÁP: dùng "|" (literal block) chứ KHÔNG dùng ">" (folded).
           # ">" gộp mọi dòng thành 1 dòng và làm hỏng dấu nháy trong lệnh, từng
