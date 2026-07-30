@@ -180,6 +180,13 @@ static volatile bool g_charge_enable = false;   // false = OFF (mặc định an
 static volatile bool g_batt_present  = false;   // tính lại mỗi vòng lặp dựa trên VbatF
 static volatile bool g_charge_just_completed = false; // cờ 1-lần: vừa tự tắt do sạc đầy (SOC=100%), chờ push lên Firebase
 
+// ---- Ngày kích hoạt thủ công do Admin đặt (devices/{id}/info/activateAt, ms) ----
+// true = được phép sạc (mặc định — hầu hết thiết bị không đặt trường này).
+// Chỉ chuyển false khi Admin đặt activateAt trong tương lai VÀ NTP đã đồng bộ
+// xác nhận rõ ràng là chưa tới ngày đó (an toàn: KHÔNG tự mở nếu chưa xác minh
+// được giờ thực — xem pull_activation()).
+static volatile bool g_activation_ok = true;
+
 // ---- Cấu hình người dùng (đồng bộ qua Firebase, lưu NVS) ----
 static volatile int   g_chem = 3;         // 0=Lead-Acid,1=Li-ion,2=LiFePO4,3=Auto
 static volatile int   g_volt_sel = 0;     // 0=Auto,12/24/36/48
@@ -309,6 +316,7 @@ static void nvs_load_all(void) {
     if (nvs_get_i32(g_nvs, "volt", &v) == ESP_OK) g_volt_sel = v; else g_volt_sel = 0;
     if (nvs_get_i32(g_nvs, "imax", &v) == ESP_OK) g_imax = v; else g_imax = 50;
     if (nvs_get_i32(g_nvs, "chgEn", &v) == ESP_OK) g_charge_enable = (v!=0); else g_charge_enable = false;
+    if (nvs_get_i32(g_nvs, "actOk", &v) == ESP_OK) g_activation_ok = (v!=0); else g_activation_ok = true;
     size_t sz = sizeof(float);
     float f;
     if (nvs_get_blob(g_nvs, "capAh", &f, &sz) == ESP_OK) g_capacity_ah = f; else g_capacity_ah = 100.0f;
@@ -327,6 +335,7 @@ static void nvs_save_config(void) {
     nvs_set_i32(g_nvs, "volt", g_volt_sel);
     nvs_set_i32(g_nvs, "imax", g_imax);
     nvs_set_i32(g_nvs, "chgEn", g_charge_enable ? 1 : 0);
+    nvs_set_i32(g_nvs, "actOk", g_activation_ok ? 1 : 0);
     nvs_set_blob(g_nvs, "capAh", (const void*)&g_capacity_ah, sizeof(float));
     nvs_commit(g_nvs);
 }
@@ -1584,8 +1593,9 @@ static void mppt_task(void *arg) {
         } else full_hold_start = 0;
         d_SOC = socNow;
 
-        // ---- OFF: chưa bật sạc (chưa bấm Start / đã bấm Stop) HOẶC không phát hiện có pin ----
-        if (!g_charge_enable || !g_batt_present) {
+        // ---- OFF: chưa bật sạc (chưa bấm Start / đã bấm Stop) HOẶC không phát hiện có pin
+        //      HOẶC chưa tới ngày kích hoạt do Admin đặt (g_activation_ok) ----
+        if (!g_charge_enable || !g_batt_present || !g_activation_ok) {
             Dold = 0;
             cnt = N_mppt_sample;
             g_status = ST_OFF;
@@ -1899,6 +1909,30 @@ static void pull_charge_enable(void) {
         g_charge_enable = v;
         nvs_save_config();
         ESP_LOGI(TAG, "chargeEnable tu web: %s", v ? "BAT (Start)" : "TAT (Stop)");
+    }
+}
+
+// Đọc ngày kích hoạt thủ công do Admin đặt (devices/{id}/info/activateAt, ms
+// epoch) — gọi mỗi ~3 giây, cùng nhịp với pull_charge_enable().
+// Rỗng/null (chưa đặt) -> luôn cho phép (g_activation_ok = true), tương thích
+// ngược với mọi thiết bị hiện có chưa từng dùng tính năng này.
+// Có giá trị nhưng NTP CHƯA đồng bộ -> KHÔNG đổi gì cả, giữ nguyên phán quyết
+// gần nhất trong NVS (an toàn: không tự mở khi chưa xác minh được giờ thực).
+static void pull_activation(void) {
+    static char buf[32];
+    if (!fb_get(dev_path("/info/activateAt"), buf, sizeof(buf))) return;
+    if (strlen(buf) < 3 || strstr(buf, "null")) {
+        if (!g_activation_ok) { g_activation_ok = true; nvs_save_config(); ESP_LOGI(TAG, "activateAt: da xoa -> cho phep sac"); }
+        return;
+    }
+    if (!g_ntp_ok) return; // chua xac minh duoc gio thuc -> giu nguyen trang thai cu
+    long long activate_ms = atoll(buf);
+    long long now_ms = (long long)time(NULL) * 1000LL;
+    bool ok = now_ms >= activate_ms;
+    if (ok != g_activation_ok) {
+        g_activation_ok = ok;
+        nvs_save_config();
+        ESP_LOGI(TAG, "activateAt: %s", ok ? "da toi ngay -> cho phep sac" : "chua toi ngay -> chan sac");
     }
 }
 
@@ -2354,7 +2388,7 @@ void app_main(void) {
         if (g_wifi_connected && g_ntp_ok) {
             if (now - last_push_cur   > 3000)   { last_push_cur=now;   push_current(); }
             if (now - last_pull_cfg   > 10000)  { last_pull_cfg=now;   pull_config(); }
-            if (now - last_pull_ctrl  > 5000)   { last_pull_ctrl=now;  pull_control(); pull_wifi_reconnect(); pull_wifi_reset(); pull_charge_enable(); pull_hw_reset(); }
+            if (now - last_pull_ctrl  > 5000)   { last_pull_ctrl=now;  pull_control(); pull_wifi_reconnect(); pull_wifi_reset(); pull_charge_enable(); pull_activation(); pull_hw_reset(); }
             if (g_charge_just_completed) { g_charge_just_completed = false; notify_charge_complete(); }
             if (now - last_pull_ota   > 30000)  { last_pull_ota=now;   pull_ota(); }
             if (now - last_stat_push  > 300000UL) { last_stat_push=now; push_daily_today(); }
